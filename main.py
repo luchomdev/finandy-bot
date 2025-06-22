@@ -20,7 +20,7 @@ MAX_OPEN_TRADES = 4
 LEVERAGE = 10
 START_AMOUNT = 10  # Monto inicial para la primera compra
 TP_PERCENT = 1.0   # Take profit ajustado para scalping (1%)
-SL_PERCENT = 3.0   # Stop loss ajustado para scalping (3%)
+SL_PERCENT = 11.0   # Stop loss ajustado para scalping (11%)
 
 client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 
