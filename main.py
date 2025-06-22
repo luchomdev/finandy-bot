@@ -5,6 +5,7 @@ import requests
 from binance.client import Client
 from ta.trend import EMAIndicator, MACD
 from ta.momentum import RSIIndicator
+from ta.volatility import BollingerBands
 from dotenv import load_dotenv
 
 # Cargar variables de entorno
@@ -17,7 +18,9 @@ FINANDY_HOOK_URL = "https://hook.finandy.com/AAT36Jzdkdb5q0vzrlUK"
 
 MAX_OPEN_TRADES = 4
 LEVERAGE = 10
-START_AMOUNT = 10  # Solo la primera compra
+START_AMOUNT = 10  # Monto inicial para la primera compra
+TP_PERCENT = 1.0   # Take profit ajustado para scalping (1%)
+SL_PERCENT = 3.0   # Stop loss ajustado para scalping (3%)
 
 client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 
@@ -51,34 +54,56 @@ def technical_signal(df):
         return None
 
     try:
-        ema20 = EMAIndicator(df['close'], window=20).ema_indicator()
-        ema50 = EMAIndicator(df['close'], window=50).ema_indicator()
-        macd_diff = MACD(df['close']).macd_diff()
-        rsi = RSIIndicator(df['close']).rsi()
+        close = df['close']
+        ema9 = EMAIndicator(close, window=9).ema_indicator()
+        ema21 = EMAIndicator(close, window=21).ema_indicator()
+        macd_diff = MACD(close).macd_diff()
+        rsi = RSIIndicator(close).rsi()
+        bb = BollingerBands(close, window=20, window_dev=2)
+        bb_width = (bb.bollinger_hband() - bb.bollinger_lband()) / bb.bollinger_mavg()
 
         latest = -1
-        # Verificar que no haya NaN
-        if any(pd.isna(x.iloc[latest]) for x in [ema20, ema50, macd_diff, rsi]):
+        # Evitar NaN
+        if any(pd.isna(x.iloc[latest]) for x in [ema9, ema21, macd_diff, rsi, bb_width]):
             return None
 
+        # Parámetros escalping y volatilidad
+        max_volatility = 0.03  # Límite de volatilidad (ancho de bandas)
+        min_macd_strength = 0.0005  # Fuerza mínima del MACD para confirmar señal
+
         long_condition = (
-            ema20.iloc[latest] > ema50.iloc[latest] and
-            macd_diff.iloc[latest] > 0 and
-            45 <= rsi.iloc[latest] <= 60
+            ema9.iloc[latest] > ema21.iloc[latest] and
+            50 < rsi.iloc[latest] < 65 and
+            macd_diff.iloc[latest] > min_macd_strength and
+            bb_width.iloc[latest] < max_volatility
         )
 
         short_condition = (
-            ema20.iloc[latest] < ema50.iloc[latest] and
-            macd_diff.iloc[latest] < 0 and
-            40 <= rsi.iloc[latest] <= 55
+            ema9.iloc[latest] < ema21.iloc[latest] and
+            35 < rsi.iloc[latest] < 50 and
+            macd_diff.iloc[latest] < -min_macd_strength and
+            bb_width.iloc[latest] < max_volatility
         )
 
-        if long_condition:
+        # Excepción para alta volatilidad pero señal muy fuerte
+        strong_long = (
+            ema9.iloc[latest] > ema21.iloc[latest] and
+            macd_diff.iloc[latest] > min_macd_strength * 5 and
+            45 < rsi.iloc[latest] < 70
+        )
+        strong_short = (
+            ema9.iloc[latest] < ema21.iloc[latest] and
+            macd_diff.iloc[latest] < -min_macd_strength * 5 and
+            30 < rsi.iloc[latest] < 55
+        )
+
+        if long_condition or strong_long:
             return "buy"
-        elif short_condition:
+        elif short_condition or strong_short:
             return "sell"
         else:
             return None
+
     except Exception as e:
         print(f"[TECH ERROR] Error en indicadores => {e}")
         return None
@@ -101,10 +126,12 @@ def send_signal_to_finandy(symbol, side):
         "side": side,
         "leverage": LEVERAGE,
         "marginType": "cross",
-        "amount": START_AMOUNT
+        "amount": START_AMOUNT,
+        "tp": TP_PERCENT,
+        "sl": SL_PERCENT
     }
     response = requests.post(FINANDY_HOOK_URL, json=payload)
-    print(f"[SIGNAL] {symbol} | {side.upper()} | ${START_AMOUNT} | Status: {response.status_code} | {response.text}")
+    print(f"[SIGNAL] {symbol} | {side.upper()} | ${START_AMOUNT} | TP: {TP_PERCENT}% | SL: {SL_PERCENT}% | Status: {response.status_code} | {response.text}")
 
 def run_bot():
     open_positions = get_open_positions()
@@ -115,7 +142,7 @@ def run_bot():
         return
 
     if available_usdt < START_AMOUNT:
-        print(f"💰 Capital insuficiente. Requiere mínimo ${START_AMOUNT}, disponible: ${available_usdt}")
+        print(f"💰 Capital insuficiente. Requiere mínimo ${START_AMOUNT}, disponible: ${available_usdt:.2f}")
         return
 
     symbols = get_futures_symbols()
