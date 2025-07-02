@@ -4,22 +4,19 @@ import pandas as pd
 import requests
 import logging
 import json
-import numpy as np
 from datetime import datetime, timedelta
 from binance.client import Client
-from ta.trend import EMAIndicator, MACD, ADXIndicator
-from ta.momentum import RSIIndicator, StochasticOscillator
+from ta.trend import EMAIndicator, MACD
+from ta.momentum import RSIIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
-from ta.volume import OnBalanceVolumeIndicator
 from dotenv import load_dotenv
-from collections import defaultdict, deque
 
 # Configurar logging robusto
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('scalping_bot.log'),
+        logging.FileHandler('trading_bot.log'),
         logging.StreamHandler()
     ]
 )
@@ -33,42 +30,87 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 FINANDY_SECRET = os.getenv("FINANDY_SECRET")
 FINANDY_HOOK_URL = "https://hook.finandy.com/AAT36Jzdkdb5q0vzrlUK"
 
-# Parámetros optimizados para scalping
-MAX_OPEN_TRADES = 6  # Incrementado para más oportunidades
-MIN_VOLUME = 100_000_000  # Mayor volumen para mejor liquidez
-MAX_SPREAD_PERCENT = 0.08  # Spread más estricto
-MIN_PRICE_CHANGE_1H = 0.5  # Mínimo cambio de precio en 1h
-MAX_PRICE_CHANGE_1H = 8.0  # Máximo cambio para evitar volatilidad extrema
+# Parámetros del bot
+MAX_OPEN_TRADES = 5
+MIN_VOLUME = 150_000_000  # Volumen mínimo aumentado
+MAX_SPREAD_PERCENT = 0.1  # Máximo spread permitido
 
-# Control de rate limits optimizado
-API_CALL_DELAY = 1.5  # Más rápido para scalping
-SCAN_INTERVAL = 15    # Escaneo más frecuente
-SIGNAL_COOLDOWN = 600  # 10 minutos entre señales del mismo símbolo
+# Control de rate limits
+API_CALL_DELAY = 2.0  # Delay más conservador
+SCAN_INTERVAL = 30    # Escaneo cada 30 segundos
 
-# Configuración de risk management
-DAILY_LOSS_LIMIT = 0.05  # Máximo 5% de pérdida diaria
-MAX_DRAWDOWN = 0.15  # Máximo 15% de drawdown
-WIN_RATE_THRESHOLD = 0.45  # Mínimo 45% de win rate
-
-# Estado del bot mejorado
+# Estado del bot
 bot_state = {
     'last_signals': {},
     'failed_symbols': set(),
     'daily_trades': 0,
-    'daily_pnl': 0.0,
-    'win_count': 0,
-    'loss_count': 0,
-    'last_reset': datetime.now().date(),
-    'symbol_performance': defaultdict(list),
-    'market_regime': 'neutral',  # trending, ranging, volatile
-    'high_performing_symbols': set(),
-    'blacklisted_symbols': set(),
-    'recent_trades': deque(maxlen=100)
+    'last_reset': datetime.now().date()
 }
 
-class ScalpingBot:
+class PerformanceTracker:
+    def __init__(self):
+        self.trades = []
+        self.start_balance = None
+        self.current_balance = None
+        
+    def add_trade(self, symbol, side, entry_price, exit_price, quantity, pnl):
+        """Registra un trade completado"""
+        self.trades.append({
+            'timestamp': datetime.now(),
+            'symbol': symbol,
+            'side': side,
+            'entry_price': entry_price,
+            'exit_price': exit_price,
+            'quantity': quantity,
+            'pnl': pnl
+        })
+        
+    def calculate_stats(self):
+        """Calcula métricas de performance"""
+        if not self.trades:
+            return None
+            
+        wins = [t for t in self.trades if t['pnl'] > 0]
+        losses = [t for t in self.trades if t['pnl'] <= 0]
+        
+        win_rate = len(wins) / len(self.trades) if self.trades else 0
+        avg_win = sum(t['pnl'] for t in wins) / len(wins) if wins else 0
+        avg_loss = sum(t['pnl'] for t in losses) / len(losses) if losses else 0
+        profit_factor = (len(wins) * avg_win) / (len(losses) * abs(avg_loss)) if losses else float('inf')
+        
+        return {
+            'total_trades': len(self.trades),
+            'win_rate': win_rate,
+            'avg_win': avg_win,
+            'avg_loss': avg_loss,
+            'profit_factor': profit_factor,
+            'total_pnl': sum(t['pnl'] for t in self.trades),
+            'max_drawdown': self.calculate_max_drawdown()
+        }
+        
+    def calculate_max_drawdown(self):
+        """Calcula el máximo drawdown"""
+        if not self.trades:
+            return 0
+            
+        running_balance = self.start_balance
+        peak = running_balance
+        max_drawdown = 0
+        
+        for trade in self.trades:
+            running_balance += trade['pnl']
+            if running_balance > peak:
+                peak = running_balance
+            drawdown = (peak - running_balance) / peak
+            if drawdown > max_drawdown:
+                max_drawdown = drawdown
+                
+        return max_drawdown
+
+class TradingBot:
     def __init__(self):
         try:
+            # Verificar variables de entorno primero
             if not BINANCE_API_KEY or not BINANCE_API_SECRET:
                 raise ValueError("ERROR: Variables de entorno BINANCE_API_KEY o BINANCE_API_SECRET no configuradas")
             
@@ -77,47 +119,22 @@ class ScalpingBot:
             
             logger.info("INIT: Variables de entorno cargadas correctamente")
             
+            # Inicializar cliente Binance
             self.client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
             logger.info("INIT: Cliente Binance inicializado")
             
+            # Inicializar performance tracker
+            self.performance_tracker = PerformanceTracker()
+            usdt_balance = self.get_available_usdt()
+            self.performance_tracker.start_balance = usdt_balance
+            self.performance_tracker.current_balance = usdt_balance
+            
+            # Verificar conectividad con reintentos
             self._test_connection()
-            self._initialize_symbol_filters()
             
         except Exception as e:
             logger.error(f"ERROR: Error inicializando bot: {e}")
             raise
-
-    def _initialize_symbol_filters(self):
-        """Inicializa filtros de símbolos basados en rendimiento histórico"""
-        try:
-            # Obtener top performers por volumen y volatilidad controlada
-            tickers = self.client.futures_24hr_ticker()
-            
-            # Filtrar y rankear símbolos
-            ranked_symbols = []
-            for ticker in tickers:
-                if not ticker['symbol'].endswith('USDT'):
-                    continue
-                    
-                volume = float(ticker['quoteVolume'])
-                price_change = abs(float(ticker['priceChangePercent']))
-                
-                if (volume > MIN_VOLUME and 
-                    MIN_PRICE_CHANGE_1H <= price_change <= MAX_PRICE_CHANGE_1H):
-                    
-                    # Score basado en volumen y volatilidad óptima
-                    score = volume * (1 + min(price_change / 5.0, 1.0))
-                    ranked_symbols.append((ticker['symbol'], score, price_change))
-            
-            # Tomar top 30 símbolos
-            ranked_symbols.sort(key=lambda x: x[1], reverse=True)
-            self.preferred_symbols = [s[0] for s in ranked_symbols[:30]]
-            
-            logger.info(f"INIT: {len(self.preferred_symbols)} símbolos preferenciales cargados")
-            
-        except Exception as e:
-            logger.error(f"ERROR: Error inicializando filtros: {e}")
-            self.preferred_symbols = []
 
     def _test_connection(self):
         """Prueba la conexión a Binance con reintentos"""
@@ -126,133 +143,109 @@ class ScalpingBot:
             try:
                 logger.info(f"TEST: Probando conexión a Binance (intento {attempt + 1}/{max_retries})...")
                 
+                # Probar conectividad básica
                 server_time = self.client.get_server_time()
                 logger.info(f"TEST: Hora del servidor Binance: {datetime.fromtimestamp(server_time['serverTime']/1000)}")
                 
+                # Probar acceso a futures
                 account = self.client.futures_account()
                 logger.info("SUCCESS: Conexión a Binance Futures establecida correctamente")
                 return True
                 
-            except Exception as e:
+            except requests.exceptions.ConnectionError as e:
                 logger.error(f"ERROR: Error de conexión (intento {attempt + 1}): {e}")
-                
+                if "getaddrinfo failed" in str(e):
+                    logger.error("ERROR: Problema de DNS. Posibles soluciones:")
+                    logger.error("   1. Verificar conexión a internet")
+                    logger.error("   2. Cambiar DNS a 8.8.8.8 o 1.1.1.1") 
+                    logger.error("   3. Desactivar VPN/Proxy si está activo")
+                    logger.error("   4. Verificar firewall/antivirus")
+                    
+            except Exception as e:
+                logger.error(f"ERROR: Error de autenticación o API (intento {attempt + 1}): {e}")
+                if "Invalid API-key" in str(e):
+                    logger.error("ERROR: Verificar BINANCE_API_KEY en archivo .env")
+                elif "Signature for this request" in str(e):
+                    logger.error("ERROR: Verificar BINANCE_API_SECRET en archivo .env")
+            
             if attempt < max_retries - 1:
                 wait_time = (attempt + 1) * 5
                 logger.info(f"WAIT: Esperando {wait_time} segundos antes del siguiente intento...")
                 time.sleep(wait_time)
         
         raise Exception("ERROR: No se pudo establecer conexión con Binance después de 3 intentos")
-    
-    def capital_requerido_por_moneda(self, capital_total):
-        primera = capital_total * 0.1
-        ordenes = [primera * (1.2 ** i) for i in range(5)]
-        return sum(ordenes)
 
-    def detect_market_regime(self):
-        """Detecta el régimen de mercado actual"""
+    def get_futures_symbols(self):
+        """Obtiene símbolos de futuros con filtros mejorados para scalping"""
         try:
-            # Usar BTC como proxy del mercado
-            klines = self.client.futures_klines(symbol='BTCUSDT', interval='1h', limit=24)
-            if not klines:
-                return 'neutral'
+            # Obtener todos los símbolos y ordenarlos por liquidez y spread
+            tickers = self.client.futures_ticker()
+            exchange_info = self.client.futures_exchange_info()
             
-            df = pd.DataFrame(klines, columns=[
-                'timestamp', 'open', 'high', 'low', 'close', 'volume',
-                'close_time', 'quote_asset_volume', 'number_of_trades',
-                'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
-            ])
+            symbol_info = {s['symbol']: s for s in exchange_info['symbols']}
+            symbol_data = []
             
-            close_prices = pd.to_numeric(df['close'])
-            volumes = pd.to_numeric(df['volume'])
-            
-            # Calcular métricas
-            price_volatility = close_prices.pct_change().std() * 100
-            trend_strength = abs(close_prices.iloc[-1] - close_prices.iloc[0]) / close_prices.iloc[0] * 100
-            volume_trend = volumes.tail(6).mean() / volumes.head(6).mean()
-            
-            # Determinar régimen
-            if trend_strength > 3 and volume_trend > 1.2:
-                regime = 'trending'
-            elif price_volatility > 4 and volume_trend > 1.5:
-                regime = 'volatile'
-            else:
-                regime = 'ranging'
-            
-            if bot_state['market_regime'] != regime:
-                logger.info(f"MARKET: Régimen cambiado de {bot_state['market_regime']} a {regime}")
-                bot_state['market_regime'] = regime
-            
-            return regime
-            
-        except Exception as e:
-            logger.error(f"ERROR: Error detectando régimen de mercado: {e}")
-            return 'neutral'
-
-    def get_scalping_symbols(self):
-        """Obtiene símbolos optimizados para scalping"""
-        try:
-            # Detectar régimen de mercado
-            market_regime = self.detect_market_regime()
-            
-            # Filtrar símbolos basado en rendimiento reciente
-            valid_symbols = []
-            
-            for symbol in self.preferred_symbols:
-                if symbol in bot_state['blacklisted_symbols']:
+            for ticker in tickers:
+                symbol = ticker['symbol']
+                
+                if not symbol.endswith('USDT'):
                     continue
                     
-                # Verificar rendimiento reciente
-                recent_performance = bot_state['symbol_performance'].get(symbol, [])
-                if len(recent_performance) >= 5:
-                    win_rate = sum(1 for p in recent_performance[-5:] if p > 0) / 5
-                    if win_rate < 0.3:  # Menos del 30% de éxito
-                        continue
+                # Calcular métricas clave para scalping
+                volume = float(ticker['quoteVolume'])
+                bid_price = float(ticker.get('bidPrice', 0))
+                ask_price = float(ticker.get('askPrice', 0))
                 
-                # Verificar liquidez en tiempo real
-                if self._check_symbol_liquidity(symbol):
-                    valid_symbols.append(symbol)
+                if bid_price <= 0 or ask_price <= 0:
+                    continue
                     
-                if len(valid_symbols) >= 20:  # Limitar búsqueda
-                    break
+                spread_percent = ((ask_price - bid_price) / bid_price) * 100
+                price = (bid_price + ask_price) / 2
+                
+                # Añadir filtros adicionales para scalping
+                if (volume > MIN_VOLUME and 
+                    spread_percent < MAX_SPREAD_PERCENT and 
+                    symbol in symbol_info and
+                    symbol_info[symbol]['status'] == 'TRADING'):
+                    
+                    # Calcular volatilidad reciente (últimas 24h)
+                    klines = self.client.futures_klines(symbol=symbol, interval='1h', limit=24)
+                    if len(klines) >= 24:
+                        closes = [float(k[4]) for k in klines]
+                        high = max(closes)
+                        low = min(closes)
+                        volatility = (high - low) / low * 100
+                        
+                        # Puntuación para scalping (mayor es mejor)
+                        score = (volume / 1_000_000) * (1 / spread_percent) * (volatility / 10)
+                        
+                        symbol_data.append({
+                            'symbol': symbol,
+                            'volume': volume,
+                            'spread': spread_percent,
+                            'volatility': volatility,
+                            'price': price,
+                            'score': score
+                        })
             
-            logger.info(f"SYMBOLS: {len(valid_symbols)} símbolos válidos para scalping")
-            return valid_symbols
+            # Ordenar por mejor puntuación para scalping
+            symbol_data.sort(key=lambda x: x['score'], reverse=True)
+            return [x['symbol'] for x in symbol_data[:30]]  # Top 30 para scalping
             
         except Exception as e:
             logger.error(f"ERROR: Error obteniendo símbolos: {e}")
             return []
 
-    def _check_symbol_liquidity(self, symbol):
-        """Verifica liquidez del símbolo"""
-        try:
-            depth = self.client.futures_order_book(symbol=symbol, limit=5)
-            
-            # Verificar spread
-            best_bid = float(depth['bids'][0][0])
-            best_ask = float(depth['asks'][0][0])
-            spread_percent = ((best_ask - best_bid) / best_bid) * 100
-            
-            # Verificar profundidad del order book
-            bid_depth = sum(float(bid[1]) for bid in depth['bids'])
-            ask_depth = sum(float(ask[1]) for ask in depth['asks'])
-            
-            return (spread_percent <= MAX_SPREAD_PERCENT and 
-                    bid_depth > 10 and ask_depth > 10)
-            
-        except Exception as e:
-            logger.debug(f"DEBUG: Error verificando liquidez {symbol}: {e}")
-            return False
-
-    def get_klines_scalping(self, symbol):
+    def get_klines_for_scalping(self, symbol):
         """Obtiene datos optimizados para scalping"""
         try:
-            # Múltiples timeframes para confirmación
-            klines_1m = self.client.futures_klines(symbol=symbol, interval='1m', limit=60)
-            klines_3m = self.client.futures_klines(symbol=symbol, interval='3m', limit=40)
-            klines_5m = self.client.futures_klines(symbol=symbol, interval='5m', limit=30)
+            # Timeframe principal para scalping (1m)
+            klines_1m = self.client.futures_klines(symbol=symbol, interval='1m', limit=100)
+            # Timeframe de confirmación (3m)
+            klines_3m = self.client.futures_klines(symbol=symbol, interval='3m', limit=50)
             
-            if not all([klines_1m, klines_3m, klines_5m]):
-                return None, None, None
+            if not klines_1m or not klines_3m or len(klines_1m) < 60:
+                return None, None
             
             def create_dataframe(klines):
                 df = pd.DataFrame(klines, columns=[
@@ -260,201 +253,187 @@ class ScalpingBot:
                     'close_time', 'quote_asset_volume', 'number_of_trades',
                     'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
                 ])
-                
-                numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'number_of_trades']
-                for col in numeric_cols:
+                for col in ['open', 'high', 'low', 'close', 'volume']:
                     df[col] = pd.to_numeric(df[col], errors='coerce')
                 
-                return df if not df['close'].isna().any() else None
+                if df['close'].isna().sum() > 0:
+                    return None
+                    
+                return df
             
             df_1m = create_dataframe(klines_1m)
             df_3m = create_dataframe(klines_3m)
-            df_5m = create_dataframe(klines_5m)
             
-            return df_1m, df_3m, df_5m
+            # Verificar que los datos sean recientes (última vela < 2 minutos)
+            if df_1m is not None:
+                last_timestamp = pd.to_datetime(df_1m['timestamp'].iloc[-1], unit='ms')
+                if datetime.now() - last_timestamp.tz_localize(None) > timedelta(minutes=2):
+                    logger.warning(f"WARNING: Datos obsoletos para {symbol}")
+                    return None, None
+            
+            return df_1m, df_3m
             
         except Exception as e:
             logger.error(f"ERROR: Error obteniendo klines para {symbol}: {e}")
-            return None, None, None
+            return None, None
 
-    def scalping_signal_advanced(self, df_1m, df_3m, df_5m, symbol):
-        """Señales avanzadas de scalping"""
-        if not all([df_1m is not None, df_3m is not None, df_5m is not None]):
+    def technical_signal_enhanced(self, df_1m, df_3m, symbol):
+        """Análisis técnico optimizado para scalping"""
+        if df_1m is None or df_3m is None or len(df_1m) < 60:
             return None
 
         try:
-            # Análisis en 1m (entrada)
-            close_1m = df_1m['close']
-            high_1m = df_1m['high']
-            low_1m = df_1m['low']
-            volume_1m = df_1m['volume']
+            # Indicadores principales (1m)
+            close = df_1m['close']
+            high = df_1m['high']
+            low = df_1m['low']
             
-            # Indicadores rápidos para scalping
-            ema8_1m = EMAIndicator(close_1m, window=8).ema_indicator()
-            ema13_1m = EMAIndicator(close_1m, window=13).ema_indicator()
-            ema21_1m = EMAIndicator(close_1m, window=21).ema_indicator()
+            # EMA rápidas para scalping
+            ema5 = EMAIndicator(close, window=5).ema_indicator()
+            ema10 = EMAIndicator(close, window=10).ema_indicator()
+            ema20 = EMAIndicator(close, window=20).ema_indicator()
             
-            # RSI rápido
-            rsi_1m = RSIIndicator(close_1m, window=7).rsi()
+            # MACD ajustado para scalping
+            macd = MACD(close, window_slow=12, window_fast=26, window_sign=9)
+            macd_line = macd.macd()
+            macd_signal = macd.macd_signal()
+            macd_diff = macd.macd_diff()
             
-            # Stochastic para momentum
-            stoch = StochasticOscillator(high_1m, low_1m, close_1m, window=14, smooth_window=3)
-            stoch_k = stoch.stoch()
-            stoch_d = stoch.stoch_signal()
+            # RSI ajustado
+            rsi = RSIIndicator(close, window=10).rsi()
             
-            # Volume confirmation
-            volume_sma = volume_1m.rolling(window=10).mean()
+            # Bollinger Bands ajustados
+            bb = BollingerBands(close, window=10, window_dev=1.5)
+            bb_upper = bb.bollinger_hband()
+            bb_lower = bb.bollinger_lband()
+            bb_middle = bb.bollinger_mavg()
             
-            # Bollinger Bands para volatilidad
-            bb_1m = BollingerBands(close_1m, window=20, window_dev=2)
-            bb_upper = bb_1m.bollinger_hband()
-            bb_lower = bb_1m.bollinger_lband()
-            bb_middle = bb_1m.bollinger_mavg()
+            # VWAP para scalping
+            typical_price = (high + low + close) / 3
+            vwap = (typical_price * df_1m['volume']).cumsum() / df_1m['volume'].cumsum()
             
-            # Análisis en 3m (confirmación)
+            # Indicadores de confirmación (3m)
             close_3m = df_3m['close']
-            ema21_3m = EMAIndicator(close_3m, window=21).ema_indicator()
-            rsi_3m = RSIIndicator(close_3m, window=14).rsi()
-            
-            # ADX para fuerza de tendencia
-            adx_3m = ADXIndicator(df_3m['high'], df_3m['low'], df_3m['close'], window=14)
-            adx_value = adx_3m.adx()
-            
-            # Análisis en 5m (filtro de tendencia)
-            close_5m = df_5m['close']
-            ema50_5m = EMAIndicator(close_5m, window=50).ema_indicator()
+            ema10_3m = EMAIndicator(close_3m, window=10).ema_indicator()
+            ema20_3m = EMAIndicator(close_3m, window=20).ema_indicator()
             
             latest = -1
-            current_price = close_1m.iloc[latest]
+            current_price = close.iloc[latest]
             
-            # Verificar que tenemos datos suficientes
-            required_indicators = [
-                ema8_1m, ema13_1m, ema21_1m, rsi_1m, stoch_k, stoch_d,
-                volume_sma, bb_upper, bb_lower, bb_middle, ema21_3m, 
-                rsi_3m, adx_value, ema50_5m
-            ]
-            
-            if any(pd.isna(indicator.iloc[latest]) for indicator in required_indicators):
-                return None
-
-            # Filtros de mercado
-            market_regime = bot_state['market_regime']
-            
-            # Calcular momentum y volatilidad
-            price_momentum = (current_price - close_1m.iloc[-5]) / close_1m.iloc[-5] * 100
-            volume_ratio = volume_1m.iloc[latest] / volume_sma.iloc[latest]
-            bb_position = (current_price - bb_lower.iloc[latest]) / (bb_upper.iloc[latest] - bb_lower.iloc[latest])
-            
-            # Condiciones base
-            trending_up_1m = ema8_1m.iloc[latest] > ema13_1m.iloc[latest] > ema21_1m.iloc[latest]
-            trending_down_1m = ema8_1m.iloc[latest] < ema13_1m.iloc[latest] < ema21_1m.iloc[latest]
-            trending_up_3m = close_3m.iloc[latest] > ema21_3m.iloc[latest]
-            trending_down_3m = close_3m.iloc[latest] < ema21_3m.iloc[latest]
-            strong_trend = adx_value.iloc[latest] > 25
-            
-            # Señales LONG optimizadas para scalping
+            # Condiciones LONG para scalping
             long_conditions = [
-                trending_up_1m,  # Tendencia alcista en 1m
-                trending_up_3m,  # Confirmación en 3m
-                current_price > ema50_5m.iloc[latest],  # Filtro de tendencia 5m
-                30 < rsi_1m.iloc[latest] < 70,  # RSI en zona favorable
-                rsi_3m.iloc[latest] > 45,  # RSI 3m no sobrevendido
-                stoch_k.iloc[latest] > stoch_d.iloc[latest],  # Stochastic alcista
-                stoch_k.iloc[latest] > 20,  # Stochastic no sobrevendido
-                volume_ratio > 1.2,  # Volumen por encima del promedio
-                strong_trend or market_regime == 'trending',  # Tendencia fuerte
-                0.2 < bb_position < 0.8,  # No en extremos de BB
-                price_momentum > -0.5  # Momentum no muy negativo
+                ema5.iloc[latest] > ema10.iloc[latest] > ema20.iloc[latest],  # EMA alineadas
+                macd_line.iloc[latest] > macd_signal.iloc[latest],  # MACD positivo
+                macd_diff.iloc[latest] > 0,  # MACD en crecimiento
+                rsi.iloc[latest] > 50 and rsi.iloc[latest] < 70,  # RSI favorable
+                current_price > vwap.iloc[latest],  # Precio sobre VWAP
+                current_price > bb_middle.iloc[latest],  # Precio sobre BB medio
+                ema10_3m.iloc[latest] > ema20_3m.iloc[latest]  # Tendencia 3m
             ]
             
-            # Señales SHORT optimizadas para scalping
+            # Condiciones SHORT para scalping
             short_conditions = [
-                trending_down_1m,  # Tendencia bajista en 1m
-                trending_down_3m,  # Confirmación en 3m
-                current_price < ema50_5m.iloc[latest],  # Filtro de tendencia 5m
-                30 < rsi_1m.iloc[latest] < 70,  # RSI en zona favorable
-                rsi_3m.iloc[latest] < 55,  # RSI 3m no sobrecomprado
-                stoch_k.iloc[latest] < stoch_d.iloc[latest],  # Stochastic bajista
-                stoch_k.iloc[latest] < 80,  # Stochastic no sobrecomprado
-                volume_ratio > 1.2,  # Volumen por encima del promedio
-                strong_trend or market_regime == 'trending',  # Tendencia fuerte
-                0.2 < bb_position < 0.8,  # No en extremos de BB
-                price_momentum < 0.5  # Momentum no muy positivo
+                ema5.iloc[latest] < ema10.iloc[latest] < ema20.iloc[latest],  # EMA alineadas
+                macd_line.iloc[latest] < macd_signal.iloc[latest],  # MACD negativo
+                macd_diff.iloc[latest] < 0,  # MACD en decrecimiento
+                rsi.iloc[latest] < 50 and rsi.iloc[latest] > 30,  # RSI favorable
+                current_price < vwap.iloc[latest],  # Precio bajo VWAP
+                current_price < bb_middle.iloc[latest],  # Precio bajo BB medio
+                ema10_3m.iloc[latest] < ema20_3m.iloc[latest]  # Tendencia 3m
             ]
             
-            # Ajustar umbrales según régimen de mercado
-            min_conditions = 8 if market_regime == 'trending' else 9
-            
-            if sum(long_conditions) >= min_conditions:
+            # Señales más agresivas para scalping
+            if sum(long_conditions) >= 6:  # 6 de 7 condiciones
                 if self._can_send_signal(symbol, 'buy'):
-                    logger.info(f"SCALP LONG: {symbol} | Condiciones: {sum(long_conditions)}/{len(long_conditions)} | Régimen: {market_regime}")
+                    logger.info(f"SIGNAL: SEÑAL LONG fuerte para {symbol} ({sum(long_conditions)}/7 condiciones)")
                     return "buy"
-                    
-            elif sum(short_conditions) >= min_conditions:
+            elif sum(short_conditions) >= 6:  # 6 de 7 condiciones
                 if self._can_send_signal(symbol, 'sell'):
-                    logger.info(f"SCALP SHORT: {symbol} | Condiciones: {sum(short_conditions)}/{len(short_conditions)} | Régimen: {market_regime}")
+                    logger.info(f"SIGNAL: SEÑAL SHORT fuerte para {symbol} ({sum(short_conditions)}/7 condiciones)")
                     return "sell"
                     
             return None
 
         except Exception as e:
-            logger.error(f"ERROR: Error en análisis de scalping para {symbol}: {e}")
+            logger.error(f"ERROR: Error en análisis técnico para {symbol}: {e}")
             return None
 
+    def _check_minimum_order_value(self, symbol, symbol_info, total_usdt):
+        """Verifica si el valor de la primera orden del grid cumple con el mínimo permitido"""
+        try:
+            # Calcular el valor de la primera orden del grid
+            # Grid de 5 órdenes: 1era orden ≈ 13% del capital (9.5/74 ≈ 12.8%)
+            first_order_value = total_usdt * 0.128  # 12.8% del capital para la primera orden
+            
+            # Obtener filtros del símbolo
+            filters = symbol_info.get('filters', [])
+            min_notional = 0
+            min_qty = 0
+            
+            for filter_item in filters:
+                if filter_item['filterType'] == 'MIN_NOTIONAL':
+                    min_notional = float(filter_item.get('minNotional', 0))
+                elif filter_item['filterType'] == 'LOT_SIZE':
+                    min_qty = float(filter_item.get('minQty', 0))
+            
+            # Verificar valor mínimo notional (valor en USDT)
+            if min_notional > 0 and first_order_value < min_notional:
+                logger.debug(f"FILTER: {symbol} rechazado - Primera orden ${first_order_value:.2f} < MIN_NOTIONAL ${min_notional:.2f}")
+                return False
+            
+            # Verificar cantidad mínima si es necesario
+            if min_qty > 0:
+                # Obtener precio actual para calcular cantidad
+                try:
+                    ticker = self.client.futures_symbol_ticker(symbol=symbol)
+                    current_price = float(ticker['price'])
+                    
+                    # Calcular cantidad que se podría comprar con la primera orden
+                    calculated_qty = first_order_value / current_price
+                    
+                    if calculated_qty < min_qty:
+                        logger.debug(f"FILTER: {symbol} rechazado - Cantidad calculada {calculated_qty:.6f} < MIN_QTY {min_qty:.6f}")
+                        return False
+                        
+                except Exception as e:
+                    logger.debug(f"FILTER: Error obteniendo precio para {symbol}: {e}")
+                    return False
+            
+            # Si llegamos aquí, el símbolo cumple con los requisitos mínimos
+            logger.debug(f"FILTER: {symbol} aprobado - Primera orden ${first_order_value:.2f} cumple requisitos")
+            return True
+            
+        except Exception as e:
+            logger.error(f"ERROR: Error verificando valor mínimo para {symbol}: {e}")
+            return False
+
     def _can_send_signal(self, symbol, side):
-        """Verifica si se puede enviar una señal con control avanzado"""
+        """Verifica si se puede enviar una señal (evita spam)"""
         key = f"{symbol}_{side}"
         last_signal_time = bot_state['last_signals'].get(key, 0)
         current_time = time.time()
         
-        # Cooldown básico
-        if current_time - last_signal_time < SIGNAL_COOLDOWN:
-            return False
-        
-        # Verificar win rate del símbolo
-        recent_performance = bot_state['symbol_performance'].get(symbol, [])
-        if len(recent_performance) >= 3:
-            recent_win_rate = sum(1 for p in recent_performance[-3:] if p > 0) / 3
-            if recent_win_rate < 0.3:
-                return False
-        
-        # Verificar límites de riesgo
-        if not self._check_risk_limits():
+        # Evitar señales duplicadas en menos de 15 minutos
+        if current_time - last_signal_time < 900:  # 15 minutos
             return False
             
         bot_state['last_signals'][key] = current_time
         return True
 
-    def _check_risk_limits(self):
-        """Verifica límites de riesgo"""
-        try:
-            # Verificar pérdida diaria
-            if bot_state['daily_pnl'] < -abs(self.get_available_usdt() * DAILY_LOSS_LIMIT):
-                logger.warning("WARNING: Límite de pérdida diaria alcanzado")
-                return False
-            
-            # Verificar win rate
-            total_trades = bot_state['win_count'] + bot_state['loss_count']
-            if total_trades > 10:
-                win_rate = bot_state['win_count'] / total_trades
-                if win_rate < WIN_RATE_THRESHOLD:
-                    logger.warning(f"WARNING: Win rate bajo: {win_rate:.2%}")
-                    return False
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"ERROR: Error verificando límites de riesgo: {e}")
-            return False
-
     def get_open_positions(self):
-        """Obtiene posiciones abiertas"""
+        """Obtiene posiciones abiertas con manejo de errores"""
         try:
             positions = self.client.futures_account()['positions']
             open_positions = []
             for pos in positions:
                 if float(pos['positionAmt']) != 0:
-                    pnl = float(pos.get('unrealizedPnl', 0))
+                    # Manejo seguro de campos que pueden no estar presentes
+                    pnl = 0.0
+                    if 'unrealizedPnl' in pos:
+                        pnl = float(pos['unrealizedPnl'])
+                    elif 'unRealizedProfit' in pos:
+                        pnl = float(pos['unRealizedProfit'])
+                    
                     open_positions.append({
                         'symbol': pos['symbol'],
                         'size': float(pos['positionAmt']),
@@ -467,212 +446,187 @@ class ScalpingBot:
             return []
 
     def get_available_usdt(self):
-        """Obtiene balance USDT"""
+        """Obtiene balance USDT total con validación"""
         try:
             balances = self.client.futures_account_balance()
             for balance in balances:
                 if balance['asset'] == 'USDT':
-                    return float(balance['balance'])
+                    # Usar 'balance' en lugar de 'availableBalance' para obtener el balance total
+                    total_balance = float(balance['balance'])
+                    available_balance = float(balance['availableBalance'])
+                    
+                    logger.info(f"BALANCE: USDT total: ${total_balance:.4f}")
+                    logger.info(f"BALANCE: USDT disponible: ${available_balance:.4f}")
+                    
+                    # Retornar el balance total (no el disponible)
+                    return total_balance
+            
+            logger.warning("WARNING: No se encontró balance de USDT")
             return 0
+            
         except Exception as e:
             logger.error(f"ERROR: Error obteniendo balance: {e}")
             return 0
 
     def send_signal_to_finandy(self, symbol, side):
-        """Envía señal a Finandy con retry logic"""
+        """Envía señal a Finandy con validación y retry"""
         payload = {
             "secret": FINANDY_SECRET,
             "symbol": symbol,
             "side": side
         }
         
+        # Retry logic
         max_retries = 3
         for attempt in range(max_retries):
             try:
                 response = requests.post(
                     FINANDY_HOOK_URL, 
                     json=payload, 
-                    timeout=15,
+                    timeout=10,
                     headers={'Content-Type': 'application/json'}
                 )
                 
                 if response.status_code == 200:
                     logger.info(f"SUCCESS: SEÑAL ENVIADA: {symbol} | {side.upper()}")
                     bot_state['daily_trades'] += 1
-                    
-                    # Registrar trade
-                    trade_data = {
-                        'symbol': symbol,
-                        'side': side,
-                        'timestamp': datetime.now(),
-                        'sent': True
-                    }
-                    bot_state['recent_trades'].append(trade_data)
-                    
                     return True
                 else:
                     logger.warning(f"WARNING: Respuesta Finandy: {response.status_code} - {response.text}")
                     
-            except Exception as e:
+            except requests.exceptions.RequestException as e:
                 logger.error(f"ERROR: Error enviando señal (intento {attempt + 1}): {e}")
                 if attempt < max_retries - 1:
                     time.sleep(2)
                     
+        logger.error(f"ERROR: Falló envío de señal para {symbol} después de {max_retries} intentos")
+        bot_state['failed_symbols'].add(symbol)
         return False
-
-    def update_performance_tracking(self):
-        """Actualiza seguimiento de rendimiento"""
-        try:
-            positions = self.get_open_positions()
-            
-            # Actualizar PnL diario
-            daily_pnl = sum(pos['pnl'] for pos in positions)
-            bot_state['daily_pnl'] = daily_pnl
-            
-            # Actualizar estadísticas por símbolo (esto requeriría lógica adicional)
-            # Por ahora, solo logging
-            if positions:
-                logger.info(f"PERFORMANCE: PnL diario: ${daily_pnl:.2f} | Posiciones: {len(positions)}")
-                
-        except Exception as e:
-            logger.error(f"ERROR: Error actualizando performance: {e}")
 
     def reset_daily_counters(self):
         """Resetea contadores diarios"""
         today = datetime.now().date()
         if bot_state['last_reset'] != today:
-            # Guardar estadísticas del día anterior
-            if bot_state['daily_trades'] > 0:
-                win_rate = bot_state['win_count'] / (bot_state['win_count'] + bot_state['loss_count']) if (bot_state['win_count'] + bot_state['loss_count']) > 0 else 0
-                logger.info(f"DAILY SUMMARY: Trades: {bot_state['daily_trades']} | Win Rate: {win_rate:.2%} | PnL: ${bot_state['daily_pnl']:.2f}")
-            
-            # Reset
             bot_state['daily_trades'] = 0
-            bot_state['daily_pnl'] = 0.0
-            bot_state['win_count'] = 0
-            bot_state['loss_count'] = 0
             bot_state['failed_symbols'].clear()
             bot_state['last_reset'] = today
-            
             logger.info("RESET: Contadores diarios reseteados")
 
-    def run_scalping_cycle(self):
-        """Ejecuta ciclo de scalping"""
+    def run_bot_cycle(self):
+        """Ejecuta un ciclo completo del bot"""
         try:
             self.reset_daily_counters()
-            self.update_performance_tracking()
-
-            if bot_state['daily_trades'] >= 20:
+            
+            # Verificar límites diarios
+            if bot_state['daily_trades'] >= 20:  # Límite diario
                 logger.info("LIMIT: Límite diario de trades alcanzado")
                 return
-
-            if not self._check_risk_limits():
-                logger.warning("WARNING: Límites de riesgo alcanzados")
-                return
-
-            total_usdt = self.get_available_usdt()
-            capital_por_operacion = self.capital_requerido_por_moneda(total_usdt)
-
+            
             open_positions = self.get_open_positions()
+            logger.info(f"POSITIONS: Posiciones abiertas: {len(open_positions)}")
+            
             if len(open_positions) >= MAX_OPEN_TRADES:
-                logger.info(f"LIMIT: Límite de posiciones alcanzado ({len(open_positions)}/{MAX_OPEN_TRADES})")
+                logger.info("LIMIT: Límite de operaciones abiertas alcanzado (4/4)")
                 return
 
-            posiciones_disponibles = MAX_OPEN_TRADES - len(open_positions)
-            capital_requerido_total = capital_por_operacion * posiciones_disponibles
-
-            if total_usdt < capital_por_operacion:
-                logger.warning(f"WARNING: Capital insuficiente incluso para una operación: ${total_usdt:.2f} < ${capital_por_operacion:.2f}")
+            # Usar balance total (no disponible) para verificar capital suficiente
+            total_usdt = self.get_available_usdt()
+            # Verificar que tengamos balance suficiente para operar
+            if total_usdt < 50:  # Balance mínimo de seguridad
+                logger.warning(f"WARNING: Capital insuficiente para operar. Balance total: ${total_usdt:.2f}")
                 return
 
-            symbols = self.get_scalping_symbols()
+            symbols = self.get_futures_symbols()
             if not symbols:
                 logger.error("ERROR: No se pudieron obtener símbolos")
                 return
-
+                
             open_symbols = {pos['symbol'] for pos in open_positions}
             signals_sent = 0
-            max_signals_per_cycle = posiciones_disponibles
-
-            logger.info(f"SCALP SCAN: Analizando {len(symbols)} símbolos para scalping...")
-
+            
+            logger.info(f"SCAN: Analizando {len(symbols)} símbolos...")
+            
             for symbol in symbols:
-                if signals_sent >= max_signals_per_cycle:
+                if signals_sent >= 2:  # Máximo 2 señales por ciclo
                     break
-
+                    
                 if symbol in open_symbols or symbol in bot_state['failed_symbols']:
                     continue
 
-                # Verificar si hay capital suficiente para una nueva operación
-                capital_restante = self.get_available_usdt()
-                if capital_restante < capital_por_operacion:
-                    logger.warning(f"SKIP: Capital insuficiente para abrir {symbol}: ${capital_restante:.2f} < ${capital_por_operacion:.2f}")
-                    continue
-
                 try:
-                    df_1m, df_3m, df_5m = self.get_klines_scalping(symbol)
-                    signal = self.scalping_signal_advanced(df_1m, df_3m, df_5m, symbol)
-
+                    df_1m, df_3m = self.get_klines_for_scalping(symbol)
+                    signal = self.technical_signal_enhanced(df_1m, df_3m, symbol)
+                    
                     if signal:
                         if self.send_signal_to_finandy(symbol, signal):
                             signals_sent += 1
                             open_symbols.add(symbol)
-
+                            
                 except Exception as e:
                     logger.error(f"ERROR: Error procesando {symbol}: {e}")
                     bot_state['failed_symbols'].add(symbol)
-
+                
                 time.sleep(API_CALL_DELAY)
-
-            logger.info(f"SCALP CYCLE: {signals_sent} señales enviadas | Régimen: {bot_state['market_regime']}")
-
+            
+            if signals_sent == 0:
+                logger.info("SCAN: No se encontraron señales válidas en este ciclo")
+            else:
+                logger.info(f"SUCCESS: Ciclo completado: {signals_sent} señales enviadas")
+                
         except Exception as e:
-            logger.error(f"ERROR: Error en ciclo de scalping: {e}")
-
+            logger.error(f"ERROR: Error en ciclo del bot: {e}")
 
 def main():
-    """Función principal del bot de scalping"""
-    logger.info("START: Iniciando Scalping Bot Avanzado...")
+    """Función principal del bot"""
+    logger.info("START: Iniciando Trading Bot Mejorado...")
     
+    # Verificar conectividad a internet primero
     try:
         import socket
         socket.create_connection(("8.8.8.8", 53), timeout=5)
-        logger.info("NETWORK: Conectividad verificada")
+        logger.info("NETWORK: Conectividad a internet verificada")
     except Exception as e:
         logger.error(f"ERROR: Sin conexión a internet: {e}")
+        logger.error("FIX: Verificar conexión de red antes de continuar")
         return
     
     try:
-        bot = ScalpingBot()
-        logger.info("SUCCESS: Bot de scalping inicializado")
+        bot = TradingBot()
+        logger.info("SUCCESS: Bot inicializado correctamente")
         
         while True:
             start_time = time.time()
-            logger.info("=" * 60)
-            logger.info("SCALP CYCLE: Iniciando ciclo de scalping...")
+            logger.info("=" * 50)
+            logger.info("CYCLE: Iniciando nuevo ciclo de escaneo...")
             
             try:
-                bot.run_scalping_cycle()
+                bot.run_bot_cycle()
+            except requests.exceptions.ConnectionError as e:
+                logger.error(f"ERROR: Error de conexión durante ciclo: {e}")
+                logger.info("WAIT: Esperando 60 segundos para reconectar...")
+                time.sleep(60)
+                continue
             except Exception as e:
                 logger.error(f"ERROR: Error en ciclo: {e}")
                 time.sleep(30)
                 continue
             
+            # Calcular tiempo de ejecución
             execution_time = time.time() - start_time
-            logger.info(f"TIMING: Ciclo completado en {execution_time:.2f}s")
+            logger.info(f"TIMING: Ciclo completado en {execution_time:.2f} segundos")
             
-            # Espera más corta para scalping
-            sleep_time = max(SCAN_INTERVAL - execution_time, 5)
-            logger.info(f"WAIT: Esperando {sleep_time:.1f}s hasta próximo ciclo...")
-            time.sleep(sleep_time)
+            # Esperar antes del próximo ciclo
+            logger.info(f"WAIT: Esperando {SCAN_INTERVAL} segundos hasta próximo escaneo...")
+            time.sleep(SCAN_INTERVAL)
             
     except KeyboardInterrupt:
         logger.info("STOP: Bot detenido por usuario")
     except Exception as e:
-        logger.error(f"ERROR: Error crítico: {e}")
+        logger.error(f"ERROR: Error crítico del bot: {e}")
         logger.info("RESTART: Reiniciando en 60 segundos...")
         time.sleep(60)
+        # Reiniciar recursivamente
         main()
-
+ 
 if __name__ == "__main__":
     main()

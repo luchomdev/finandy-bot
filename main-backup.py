@@ -31,7 +31,7 @@ FINANDY_SECRET = os.getenv("FINANDY_SECRET")
 FINANDY_HOOK_URL = "https://hook.finandy.com/AAT36Jzdkdb5q0vzrlUK"
 
 # Parámetros del bot
-MAX_OPEN_TRADES = 4
+MAX_OPEN_TRADES = 5
 MIN_VOLUME = 150_000_000  # Volumen mínimo aumentado
 MAX_SPREAD_PERCENT = 0.1  # Máximo spread permitido
 
@@ -324,15 +324,17 @@ class TradingBot:
             min_qty = 0
             
             for filter_item in filters:
-                if filter_item['filterType'] == 'MIN_NOTIONAL':
-                    min_notional = float(filter_item.get('minNotional', 0))
-                elif filter_item['filterType'] == 'LOT_SIZE':
+                if filter_item['filterType'] in ['MIN_NOTIONAL', 'NOTIONAL']:
+                    min_notional = float(filter_item.get('notional', filter_item.get('minNotional', 0)))
+                elif filter_item['filterType'] in ['LOT_SIZE', 'MARKET_LOT_SIZE']:
                     min_qty = float(filter_item.get('minQty', 0))
+
             
             # Verificar valor mínimo notional (valor en USDT)
             if min_notional > 0 and first_order_value < min_notional:
-                logger.debug(f"FILTER: {symbol} rechazado - Primera orden ${first_order_value:.2f} < MIN_NOTIONAL ${min_notional:.2f}")
+                logger.warning(f"SKIP: {symbol} rechazado - Primera orden ${first_order_value:.2f} < MIN_NOTIONAL ${min_notional:.2f}")
                 return False
+
             
             # Verificar cantidad mínima si es necesario
             if min_qty > 0:
@@ -471,7 +473,7 @@ class TradingBot:
             self.reset_daily_counters()
             
             # Verificar límites diarios
-            if bot_state['daily_trades'] >= 10:  # Límite diario
+            if bot_state['daily_trades'] >= 30:  # Límite diario
                 logger.info("LIMIT: Límite diario de trades alcanzado")
                 return
             
@@ -580,6 +582,6 @@ def main():
         time.sleep(60)
         # Reiniciar recursivamente
         main()
-
+ 
 if __name__ == "__main__":
     main()
