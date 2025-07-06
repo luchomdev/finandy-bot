@@ -47,66 +47,6 @@ bot_state = {
     'last_reset': datetime.now().date()
 }
 
-class PerformanceTracker:
-    def __init__(self):
-        self.trades = []
-        self.start_balance = None
-        self.current_balance = None
-        
-    def add_trade(self, symbol, side, entry_price, exit_price, quantity, pnl):
-        """Registra un trade completado"""
-        self.trades.append({
-            'timestamp': datetime.now(),
-            'symbol': symbol,
-            'side': side,
-            'entry_price': entry_price,
-            'exit_price': exit_price,
-            'quantity': quantity,
-            'pnl': pnl
-        })
-        
-    def calculate_stats(self):
-        """Calcula métricas de performance"""
-        if not self.trades:
-            return None
-            
-        wins = [t for t in self.trades if t['pnl'] > 0]
-        losses = [t for t in self.trades if t['pnl'] <= 0]
-        
-        win_rate = len(wins) / len(self.trades) if self.trades else 0
-        avg_win = sum(t['pnl'] for t in wins) / len(wins) if wins else 0
-        avg_loss = sum(t['pnl'] for t in losses) / len(losses) if losses else 0
-        profit_factor = (len(wins) * avg_win) / (len(losses) * abs(avg_loss)) if losses else float('inf')
-        
-        return {
-            'total_trades': len(self.trades),
-            'win_rate': win_rate,
-            'avg_win': avg_win,
-            'avg_loss': avg_loss,
-            'profit_factor': profit_factor,
-            'total_pnl': sum(t['pnl'] for t in self.trades),
-            'max_drawdown': self.calculate_max_drawdown()
-        }
-        
-    def calculate_max_drawdown(self):
-        """Calcula el máximo drawdown"""
-        if not self.trades:
-            return 0
-            
-        running_balance = self.start_balance
-        peak = running_balance
-        max_drawdown = 0
-        
-        for trade in self.trades:
-            running_balance += trade['pnl']
-            if running_balance > peak:
-                peak = running_balance
-            drawdown = (peak - running_balance) / peak
-            if drawdown > max_drawdown:
-                max_drawdown = drawdown
-                
-        return max_drawdown
-
 class TradingBot:
     def __init__(self):
         try:
@@ -122,12 +62,6 @@ class TradingBot:
             # Inicializar cliente Binance
             self.client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
             logger.info("INIT: Cliente Binance inicializado")
-            
-            # Inicializar performance tracker
-            self.performance_tracker = PerformanceTracker()
-            usdt_balance = self.get_available_usdt()
-            self.performance_tracker.start_balance = usdt_balance
-            self.performance_tracker.current_balance = usdt_balance
             
             # Verificar conectividad con reintentos
             self._test_connection()
@@ -176,75 +110,65 @@ class TradingBot:
         raise Exception("ERROR: No se pudo establecer conexión con Binance después de 3 intentos")
 
     def get_futures_symbols(self):
-        """Obtiene símbolos de futuros con filtros mejorados para scalping"""
+        """Obtiene símbolos de futuros con filtros mejorados"""
         try:
-            # Obtener todos los símbolos y ordenarlos por liquidez y spread
             tickers = self.client.futures_ticker()
             exchange_info = self.client.futures_exchange_info()
             
+            # Crear mapa de información de símbolos
             symbol_info = {s['symbol']: s for s in exchange_info['symbols']}
-            symbol_data = []
             
+            # Obtener capital total para calcular valor mínimo de primera orden
+            total_usdt = self.get_available_usdt()
+            
+            filtered_symbols = []
             for ticker in tickers:
                 symbol = ticker['symbol']
                 
+                # Filtros básicos
                 if not symbol.endswith('USDT'):
                     continue
                     
-                # Calcular métricas clave para scalping
                 volume = float(ticker['quoteVolume'])
+                if volume < MIN_VOLUME:
+                    continue
+                
+                # Verificar que el símbolo esté activo
+                if symbol in symbol_info:
+                    symbol_data = symbol_info[symbol]
+                    if symbol_data['status'] != 'TRADING':
+                        continue
+                
+                # Filtrar por spread
                 bid_price = float(ticker.get('bidPrice', 0))
                 ask_price = float(ticker.get('askPrice', 0))
+                if bid_price > 0 and ask_price > 0:
+                    spread_percent = ((ask_price - bid_price) / bid_price) * 100
+                    if spread_percent > MAX_SPREAD_PERCENT:
+                        continue
                 
-                if bid_price <= 0 or ask_price <= 0:
+                # Verificar valor mínimo de primera orden del grid
+                if not self._check_minimum_order_value(symbol, symbol_data, total_usdt):
                     continue
-                    
-                spread_percent = ((ask_price - bid_price) / bid_price) * 100
-                price = (bid_price + ask_price) / 2
                 
-                # Añadir filtros adicionales para scalping
-                if (volume > MIN_VOLUME and 
-                    spread_percent < MAX_SPREAD_PERCENT and 
-                    symbol in symbol_info and
-                    symbol_info[symbol]['status'] == 'TRADING'):
-                    
-                    # Calcular volatilidad reciente (últimas 24h)
-                    klines = self.client.futures_klines(symbol=symbol, interval='1h', limit=24)
-                    if len(klines) >= 24:
-                        closes = [float(k[4]) for k in klines]
-                        high = max(closes)
-                        low = min(closes)
-                        volatility = (high - low) / low * 100
-                        
-                        # Puntuación para scalping (mayor es mejor)
-                        score = (volume / 1_000_000) * (1 / spread_percent) * (volatility / 10)
-                        
-                        symbol_data.append({
-                            'symbol': symbol,
-                            'volume': volume,
-                            'spread': spread_percent,
-                            'volatility': volatility,
-                            'price': price,
-                            'score': score
-                        })
+                filtered_symbols.append(symbol)
             
-            # Ordenar por mejor puntuación para scalping
-            symbol_data.sort(key=lambda x: x['score'], reverse=True)
-            return [x['symbol'] for x in symbol_data[:30]]  # Top 30 para scalping
+            logger.info(f"SYMBOLS: {len(filtered_symbols)} símbolos válidos encontrados")
+            return filtered_symbols[:50]  # Limitar a top 50 por volumen
             
         except Exception as e:
             logger.error(f"ERROR: Error obteniendo símbolos: {e}")
             return []
 
-    def get_klines_for_scalping(self, symbol):
-        """Obtiene datos optimizados para scalping"""
+    def get_klines_multi_timeframe(self, symbol):
+        """Obtiene datos de múltiples timeframes para confirmación"""
         try:
-            # Timeframe principal para scalping (1m)
-            klines_1m = self.client.futures_klines(symbol=symbol, interval='1m', limit=100)
-            # Timeframe de confirmación (3m)
-            klines_3m = self.client.futures_klines(symbol=symbol, interval='3m', limit=50)
+            # Timeframe principal (5m)
+            klines_5m = self.client.futures_klines(symbol=symbol, interval='5m', limit=100)
+            # Timeframe de confirmación (15m)
+            klines_15m = self.client.futures_klines(symbol=symbol, interval='15m', limit=50)
             
-            if not klines_1m or not klines_3m or len(klines_1m) < 60:
+            if not klines_5m or not klines_15m or len(klines_5m) < 60:
                 return None, None
             
             def create_dataframe(klines):
@@ -256,100 +180,129 @@ class TradingBot:
                 for col in ['open', 'high', 'low', 'close', 'volume']:
                     df[col] = pd.to_numeric(df[col], errors='coerce')
                 
+                # Verificar datos válidos
                 if df['close'].isna().sum() > 0:
                     return None
                     
                 return df
             
-            df_1m = create_dataframe(klines_1m)
-            df_3m = create_dataframe(klines_3m)
+            df_5m = create_dataframe(klines_5m)
+            df_15m = create_dataframe(klines_15m)
             
-            # Verificar que los datos sean recientes (última vela < 2 minutos)
-            if df_1m is not None:
-                last_timestamp = pd.to_datetime(df_1m['timestamp'].iloc[-1], unit='ms')
-                if datetime.now() - last_timestamp.tz_localize(None) > timedelta(minutes=2):
+            # Verificar que los datos sean recientes (última vela < 10 minutos)
+            if df_5m is not None:
+                last_timestamp = pd.to_datetime(df_5m['timestamp'].iloc[-1], unit='ms')
+                if datetime.now() - last_timestamp.tz_localize(None) > timedelta(minutes=10):
                     logger.warning(f"WARNING: Datos obsoletos para {symbol}")
                     return None, None
             
-            return df_1m, df_3m
+            return df_5m, df_15m
             
         except Exception as e:
             logger.error(f"ERROR: Error obteniendo klines para {symbol}: {e}")
             return None, None
 
-    def technical_signal_enhanced(self, df_1m, df_3m, symbol):
-        """Análisis técnico optimizado para scalping"""
-        if df_1m is None or df_3m is None or len(df_1m) < 60:
+    def technical_signal_enhanced(self, df_5m, df_15m, symbol):
+        """Análisis técnico mejorado con múltiples confirmaciones"""
+        if df_5m is None or df_15m is None or len(df_5m) < 60:
             return None
 
         try:
-            # Indicadores principales (1m)
-            close = df_1m['close']
-            high = df_1m['high']
-            low = df_1m['low']
+            # Indicadores timeframe 5m
+            close_5m = df_5m['close']
+            high_5m = df_5m['high']
+            low_5m = df_5m['low']
             
-            # EMA rápidas para scalping
-            ema5 = EMAIndicator(close, window=5).ema_indicator()
-            ema10 = EMAIndicator(close, window=10).ema_indicator()
-            ema20 = EMAIndicator(close, window=20).ema_indicator()
+            ema9_5m = EMAIndicator(close_5m, window=9).ema_indicator()
+            ema21_5m = EMAIndicator(close_5m, window=21).ema_indicator()
+            ema50_5m = EMAIndicator(close_5m, window=50).ema_indicator()
             
-            # MACD ajustado para scalping
-            macd = MACD(close, window_slow=12, window_fast=26, window_sign=9)
-            macd_line = macd.macd()
-            macd_signal = macd.macd_signal()
-            macd_diff = macd.macd_diff()
+            macd_5m = MACD(close_5m)
+            macd_line = macd_5m.macd()
+            macd_signal = macd_5m.macd_signal()
+            macd_diff = macd_5m.macd_diff()
             
-            # RSI ajustado
-            rsi = RSIIndicator(close, window=10).rsi()
+            rsi_5m = RSIIndicator(close_5m, window=14).rsi()
             
-            # Bollinger Bands ajustados
-            bb = BollingerBands(close, window=10, window_dev=1.5)
-            bb_upper = bb.bollinger_hband()
-            bb_lower = bb.bollinger_lband()
-            bb_middle = bb.bollinger_mavg()
+            bb_5m = BollingerBands(close_5m, window=20, window_dev=2)
+            bb_upper = bb_5m.bollinger_hband()
+            bb_lower = bb_5m.bollinger_lband()
+            bb_middle = bb_5m.bollinger_mavg()
+            bb_width = (bb_upper - bb_lower) / bb_middle
             
-            # VWAP para scalping
-            typical_price = (high + low + close) / 3
-            vwap = (typical_price * df_1m['volume']).cumsum() / df_1m['volume'].cumsum()
+            # ATR para volatilidad
+            atr = AverageTrueRange(high_5m, low_5m, close_5m, window=14).average_true_range()
             
-            # Indicadores de confirmación (3m)
-            close_3m = df_3m['close']
-            ema10_3m = EMAIndicator(close_3m, window=10).ema_indicator()
-            ema20_3m = EMAIndicator(close_3m, window=20).ema_indicator()
+            # Indicadores timeframe 15m para tendencia
+            close_15m = df_15m['close']
+            ema21_15m = EMAIndicator(close_15m, window=21).ema_indicator()
+            ema50_15m = EMAIndicator(close_15m, window=50).ema_indicator()
+            rsi_15m = RSIIndicator(close_15m, window=14).rsi()
             
             latest = -1
-            current_price = close.iloc[latest]
             
-            # Condiciones LONG para scalping
+            # Verificar NaN values
+            indicators_5m = [ema9_5m, ema21_5m, ema50_5m, macd_diff, rsi_5m, bb_width, atr]
+            indicators_15m = [ema21_15m, ema50_15m, rsi_15m]
+            
+            if any(pd.isna(ind.iloc[latest]) for ind in indicators_5m + indicators_15m):
+                return None
+
+            # Parámetros mejorados
+            current_price = close_5m.iloc[latest]
+            atr_value = atr.iloc[latest] / current_price  # ATR normalizado
+            max_volatility = 0.025  # Límite de volatilidad más estricto
+            min_macd_strength = atr_value * 0.5  # MACD mínimo basado en ATR
+            
+            # Filtros de mercado
+            # 1. Volatilidad controlada
+            if bb_width.iloc[latest] > max_volatility and atr_value > 0.02:
+                return None
+            
+            # 2. Evitar rangos laterales (EMAs muy cercanas)
+            ema_diff_5m = abs(ema9_5m.iloc[latest] - ema21_5m.iloc[latest]) / current_price
+            if ema_diff_5m < 0.001:  # EMAs muy cercanas = rango lateral
+                return None
+            
+            # 3. Confirmación de tendencia en 15m
+            trend_15m_bullish = ema21_15m.iloc[latest] > ema50_15m.iloc[latest]
+            trend_15m_bearish = ema21_15m.iloc[latest] < ema50_15m.iloc[latest]
+            
+            # Condiciones LONG mejoradas
             long_conditions = [
-                ema5.iloc[latest] > ema10.iloc[latest] > ema20.iloc[latest],  # EMA alineadas
-                macd_line.iloc[latest] > macd_signal.iloc[latest],  # MACD positivo
-                macd_diff.iloc[latest] > 0,  # MACD en crecimiento
-                rsi.iloc[latest] > 50 and rsi.iloc[latest] < 70,  # RSI favorable
-                current_price > vwap.iloc[latest],  # Precio sobre VWAP
-                current_price > bb_middle.iloc[latest],  # Precio sobre BB medio
-                ema10_3m.iloc[latest] > ema20_3m.iloc[latest]  # Tendencia 3m
+                ema9_5m.iloc[latest] > ema21_5m.iloc[latest],  # Tendencia corto plazo alcista
+                ema21_5m.iloc[latest] > ema50_5m.iloc[latest],  # Tendencia medio plazo alcista
+                trend_15m_bullish,  # Confirmación 15m
+                45 < rsi_5m.iloc[latest] < 70,  # RSI en zona favorable
+                30 < rsi_15m.iloc[latest] < 75,  # RSI 15m no sobrecomprado
+                macd_diff.iloc[latest] > min_macd_strength,  # MACD positivo y fuerte
+                macd_line.iloc[latest] > macd_signal.iloc[latest],  # MACD por encima de señal
+                current_price > bb_middle.iloc[latest],  # Precio por encima de BB media
+                current_price < bb_upper.iloc[latest] * 0.98  # No muy cerca del BB superior
             ]
             
-            # Condiciones SHORT para scalping
+            # Condiciones SHORT mejoradas
             short_conditions = [
-                ema5.iloc[latest] < ema10.iloc[latest] < ema20.iloc[latest],  # EMA alineadas
-                macd_line.iloc[latest] < macd_signal.iloc[latest],  # MACD negativo
-                macd_diff.iloc[latest] < 0,  # MACD en decrecimiento
-                rsi.iloc[latest] < 50 and rsi.iloc[latest] > 30,  # RSI favorable
-                current_price < vwap.iloc[latest],  # Precio bajo VWAP
-                current_price < bb_middle.iloc[latest],  # Precio bajo BB medio
-                ema10_3m.iloc[latest] < ema20_3m.iloc[latest]  # Tendencia 3m
+                ema9_5m.iloc[latest] < ema21_5m.iloc[latest],  # Tendencia corto plazo bajista
+                ema21_5m.iloc[latest] < ema50_5m.iloc[latest],  # Tendencia medio plazo bajista
+                trend_15m_bearish,  # Confirmación 15m
+                30 < rsi_5m.iloc[latest] < 55,  # RSI en zona favorable
+                25 < rsi_15m.iloc[latest] < 70,  # RSI 15m no sobrevendido
+                macd_diff.iloc[latest] < -min_macd_strength,  # MACD negativo y fuerte
+                macd_line.iloc[latest] < macd_signal.iloc[latest],  # MACD por debajo de señal
+                current_price < bb_middle.iloc[latest],  # Precio por debajo de BB media
+                current_price > bb_lower.iloc[latest] * 1.02  # No muy cerca del BB inferior
             ]
             
-            # Señales más agresivas para scalping
-            if sum(long_conditions) >= 6:  # 6 de 7 condiciones
+            # Señales de alta probabilidad
+            if sum(long_conditions) >= 7:  # Al menos 7 de 9 condiciones
+                # Verificar que no hayamos enviado señal reciente
                 if self._can_send_signal(symbol, 'buy'):
-                    logger.info(f"SIGNAL: SEÑAL LONG fuerte para {symbol} ({sum(long_conditions)}/7 condiciones)")
+                    logger.info(f"SIGNAL: SEÑAL LONG fuerte para {symbol} ({sum(long_conditions)}/9 condiciones)")
                     return "buy"
-            elif sum(short_conditions) >= 6:  # 6 de 7 condiciones
+            elif sum(short_conditions) >= 7:  # Al menos 7 de 9 condiciones
                 if self._can_send_signal(symbol, 'sell'):
-                    logger.info(f"SIGNAL: SEÑAL SHORT fuerte para {symbol} ({sum(short_conditions)}/7 condiciones)")
+                    logger.info(f"SIGNAL: SEÑAL SHORT fuerte para {symbol} ({sum(short_conditions)}/9 condiciones)")
                     return "sell"
                     
             return None
@@ -371,15 +324,17 @@ class TradingBot:
             min_qty = 0
             
             for filter_item in filters:
-                if filter_item['filterType'] == 'MIN_NOTIONAL':
-                    min_notional = float(filter_item.get('minNotional', 0))
-                elif filter_item['filterType'] == 'LOT_SIZE':
+                if filter_item['filterType'] in ['MIN_NOTIONAL', 'NOTIONAL']:
+                    min_notional = float(filter_item.get('notional', filter_item.get('minNotional', 0)))
+                elif filter_item['filterType'] in ['LOT_SIZE', 'MARKET_LOT_SIZE']:
                     min_qty = float(filter_item.get('minQty', 0))
+
             
             # Verificar valor mínimo notional (valor en USDT)
             if min_notional > 0 and first_order_value < min_notional:
-                logger.debug(f"FILTER: {symbol} rechazado - Primera orden ${first_order_value:.2f} < MIN_NOTIONAL ${min_notional:.2f}")
+                logger.warning(f"SKIP: {symbol} rechazado - Primera orden ${first_order_value:.2f} < MIN_NOTIONAL ${min_notional:.2f}")
                 return False
+
             
             # Verificar cantidad mínima si es necesario
             if min_qty > 0:
@@ -518,7 +473,7 @@ class TradingBot:
             self.reset_daily_counters()
             
             # Verificar límites diarios
-            if bot_state['daily_trades'] >= 20:  # Límite diario
+            if bot_state['daily_trades'] >= 30:  # Límite diario
                 logger.info("LIMIT: Límite diario de trades alcanzado")
                 return
             
@@ -554,8 +509,8 @@ class TradingBot:
                     continue
 
                 try:
-                    df_1m, df_3m = self.get_klines_for_scalping(symbol)
-                    signal = self.technical_signal_enhanced(df_1m, df_3m, symbol)
+                    df_5m, df_15m = self.get_klines_multi_timeframe(symbol)
+                    signal = self.technical_signal_enhanced(df_5m, df_15m, symbol)
                     
                     if signal:
                         if self.send_signal_to_finandy(symbol, signal):
