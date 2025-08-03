@@ -255,8 +255,8 @@ class TradingBot:
             volumen_confirmado = vol_5m.iloc[latest] > avg_vol_5m.iloc[-2]
 
             # PATRÓN VELA MARTILLO
-            ultimo = df_5m.iloc[latest]
-            patron_martillo = es_martillo(ultimo)
+            #ultimo = df_5m.iloc[latest]
+            #patron_martillo = es_martillo(ultimo)
 
             # BLOQUE ANTI-SPIKE
             extension_ema = abs(current_price - ema21_5m.iloc[latest]) / ema21_5m.iloc[latest]
