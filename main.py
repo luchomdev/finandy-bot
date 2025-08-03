@@ -178,6 +178,7 @@ class TradingBot:
     def technical_signal_enhanced(self, df_5m, df_15m, symbol):
         if df_5m is None or df_15m is None or len(df_5m) < 60:
             return None
+
         try:
             close_5m = df_5m['close']
             high_5m = df_5m['high']
@@ -229,13 +230,32 @@ class TradingBot:
             trend_15m_bullish = ema21_15m.iloc[latest] > ema50_15m.iloc[latest]
             trend_15m_bearish = ema21_15m.iloc[latest] < ema50_15m.iloc[latest]
 
-            # CONFIRMACIÓN VOLUMEN: Volumen actual vs promedio rolling ultimas 5 velas (sin contar la última)
+            # CONFIRMACIÓN VOLUMEN
             avg_vol_5m = vol_5m.rolling(window=5).mean()
             volumen_confirmado = vol_5m.iloc[latest] > avg_vol_5m.iloc[-2]
 
-            # PATRÓN VELA MARTILLO EN ÚLTIMA VELA 5min
+            # PATRÓN VELA MARTILLO
             ultimo = df_5m.iloc[latest]
             patron_martillo = es_martillo(ultimo)
+
+            # BLOQUE ANTI-SPIKE
+            extension_ema = abs(current_price - ema21_5m.iloc[latest]) / ema21_5m.iloc[latest]
+            spike_bb_up = current_price > bb_upper.iloc[latest]
+            spike_bb_down = current_price < bb_lower.iloc[latest]
+            rango_ultimo = high_5m.iloc[latest] - low_5m.iloc[latest]
+            rango_promedio = (high_5m - low_5m).rolling(10).mean().iloc[-2]
+            spike_vela = rango_ultimo > 1.8 * rango_promedio
+            sobrecompra_rsi = rsi_5m.iloc[latest] > 74
+            sobreventa_rsi = rsi_5m.iloc[latest] < 25
+
+            if ((extension_ema > 0.028 or spike_bb_up or spike_vela or sobrecompra_rsi) and (macd_diff.iloc[latest] < 0)):
+                logger.info(f"ANTI-SPIKE: Spike alcista + MACD bajista, NO se opera LONG ni SHORT aquí.")
+                return None
+
+            if ((extension_ema > 0.028 or spike_bb_down or spike_vela or sobreventa_rsi) and (macd_diff.iloc[latest] > 0)):
+                logger.info(f"ANTI-SPIKE: Spike bajista + MACD alcista, NO se opera SHORT ni LONG aquí.")
+                return None
+            # FIN BLOQUE ANTI-SPIKE
 
             long_conditions = [
                 ema9_5m.iloc[latest] > ema21_5m.iloc[latest],
@@ -249,7 +269,7 @@ class TradingBot:
                 current_price < bb_upper.iloc[latest] * 0.98,
                 volumen_confirmado,
                 patron_martillo,
-                self.get_trend_higher_tf(symbol, interval='1h')  # Tendencia 1h alcista
+                self.get_trend_higher_tf(symbol, interval='1h')
             ]
 
             short_conditions = [
@@ -263,8 +283,8 @@ class TradingBot:
                 current_price < bb_middle.iloc[latest],
                 current_price > bb_lower.iloc[latest] * 1.02,
                 volumen_confirmado,
-                patron_martillo,  # Recomendable ajustar a patrón bajista específico si deseas
-                not self.get_trend_higher_tf(symbol, interval='1h')  # Tendencia 1h bajista
+                patron_martillo,
+                not self.get_trend_higher_tf(symbol, interval='1h')
             ]
 
             signal = None
@@ -277,7 +297,7 @@ class TradingBot:
                     logger.info(f"SIGNAL: SEÑAL SHORT fuerte para {symbol} ({sum(short_conditions)}/12 condiciones)")
                     signal = "sell"
 
-            # Filtros de estructura de precio
+            # Filtro estructura de precio
             next_support, next_resistance = self.price_structure_filter(df_5m, df_15m, current_price)
             if signal == "buy" and next_resistance and ((next_resistance - current_price) / current_price) < 0.007:
                 logger.info(f"Filtro estructura: resistencia muy cerca ({next_resistance}) -> señal descartada")
@@ -287,9 +307,11 @@ class TradingBot:
                 return None
 
             return signal
+
         except Exception as e:
-            logger.error(f"ERROR: Error en análisis técnico para {symbol}: {e}")
-            return None
+         logger.error(f"ERROR: Error en análisis técnico para {symbol}: {e}")
+        return None
+
 
     def btc_market_filter(self):
         df_btc_15m, _ = self.get_klines_multi_timeframe("BTCUSDT")
