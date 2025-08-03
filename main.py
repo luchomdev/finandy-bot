@@ -60,8 +60,20 @@ def create_dataframe(klines):
         return None
     return df
 
+# NUEVO: funciones separadas para patrones de vela
+def es_martillo_alcista(row):
+    cuerpo = abs(row['close'] - row['open'])
+    mecha_inferior = min(row['close'], row['open']) - row['low']
+    mecha_superior = row['high'] - max(row['close'], row['open'])
+    return mecha_inferior > cuerpo * 2 and mecha_superior < cuerpo
 
-def es_martillo(row):
+def es_martillo_bajista(row):
+    cuerpo = abs(row['close'] - row['open'])
+    mecha_superior = row['high'] - max(row['close'], row['open'])
+    mecha_inferior = min(row['close'], row['open']) - row['low']
+    return mecha_superior > cuerpo * 2 and mecha_inferior < cuerpo
+
+# def es_martillo(row):
     cuerpo = abs(row['close'] - row['open'])
     mecha_superior = row['high'] - max(row['close'], row['open'])
     mecha_inferior = min(row['close'], row['open']) - row['low']
@@ -209,10 +221,18 @@ class TradingBot:
             rsi_15m = RSIIndicator(close_15m, window=14).rsi()
 
             latest = -1
-
+            
             # Validación NAs
             indicators_5m = [ema9_5m, ema21_5m, ema50_5m, macd_diff, rsi_5m, bb_width, atr]
             indicators_15m = [ema21_15m, ema50_15m, rsi_15m]
+            
+            # NUEVO: preparación para validaciones adicionales
+            prev_close = df_5m['close'].iloc[-2]
+            current_close = df_5m['close'].iloc[-1]
+            vol_actual = vol_5m.iloc[-1]
+            vol_3media = vol_5m.rolling(window=3).mean().iloc[-2]
+            patron_martillo_long = es_martillo_alcista(df_5m.iloc[latest])
+            patron_martillo_short = es_martillo_bajista(df_5m.iloc[latest])
             if any(pd.isna(ind.iloc[latest]) for ind in indicators_5m + indicators_15m):
                 return None
 
@@ -268,7 +288,7 @@ class TradingBot:
                 current_price > bb_middle.iloc[latest],
                 current_price < bb_upper.iloc[latest] * 0.98,
                 volumen_confirmado,
-                patron_martillo,
+                patron_martillo_long, 
                 self.get_trend_higher_tf(symbol, interval='1h')
             ]
 
@@ -283,7 +303,7 @@ class TradingBot:
                 current_price < bb_middle.iloc[latest],
                 current_price > bb_lower.iloc[latest] * 1.02,
                 volumen_confirmado,
-                patron_martillo,
+                patron_martillo_short,
                 not self.get_trend_higher_tf(symbol, interval='1h')
             ]
 
@@ -305,6 +325,34 @@ class TradingBot:
             if signal == "sell" and next_support and ((current_price - next_support) / current_price) < 0.007:
                 logger.info(f"Filtro estructura: soporte muy cerca ({next_support}) -> señal descartada")
                 return None
+            
+            # NUEVO: Confirmación de vela siguiente
+            if signal == "buy" and current_close < prev_close:
+                logger.info("CONFIRM: Vela actual no confirma subida. Señal long ignorada.")
+                return None
+            if signal == "sell" and current_close > prev_close:
+                logger.info("CONFIRM: Vela actual no confirma caída. Señal short ignorada.")
+                return None
+
+            # NUEVO: Spike + RSI extremo + volumen bajo
+            if spike_vela and (sobrecompra_rsi or sobreventa_rsi) and vol_actual < vol_3media:
+                logger.info("ANTI-FAKE: Movimiento sospechoso con volumen bajo y RSI extremo.")
+                return None
+
+            # NUEVO: Confirmación tendencia 1h
+            tendencia_1h = self.get_trend_higher_tf(symbol, interval='1h')
+            if signal == "buy" and not tendencia_1h:
+                logger.info("FILTER: Tendencia 1h bajista, señal long ignorada.")
+                return None
+            if signal == "sell" and tendencia_1h:
+                logger.info("FILTER: Tendencia 1h alcista, señal short ignorada.")
+                return None
+
+            # NUEVO: Confirmación volumen ruptura
+            if vol_actual < vol_3media * 1.1:
+                logger.info("VOL: Volumen no confirma ruptura. Señal descartada.")
+                return None
+
 
             return signal
 
