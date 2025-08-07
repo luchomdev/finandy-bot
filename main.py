@@ -3,14 +3,12 @@ import time
 import pandas as pd
 import requests
 import logging
-import json
 from datetime import datetime, timedelta
 from binance.client import Client
 from ta.trend import EMAIndicator, MACD
 from ta.momentum import RSIIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
 from dotenv import load_dotenv
-
 
 # Configuración del logging
 logging.basicConfig(
@@ -23,7 +21,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 # Cargar variables de entorno
 load_dotenv()
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
@@ -31,22 +28,17 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 FINANDY_SECRET = os.getenv("FINANDY_SECRET")
 FINANDY_HOOK_URL = "https://hook.finandy.com/AAT36Jzdkdb5q0vzrlUK"
 
-
-# Parámetros del bot
 MAX_OPEN_TRADES = 5
 MIN_VOLUME = 150_000_000
 MAX_SPREAD_PERCENT = 0.1
 API_CALL_DELAY = 2.0
 SCAN_INTERVAL = 30
 
-
 bot_state = {
     'last_signals': {},
     'failed_symbols': set(),
-    # Se elimina daily_trades para no limitar operaciones diarias
     'last_reset': datetime.now().date()
 }
-
 
 def create_dataframe(klines):
     df = pd.DataFrame(klines, columns=[
@@ -60,7 +52,6 @@ def create_dataframe(klines):
         return None
     return df
 
-# NUEVO: funciones separadas para patrones de vela
 def es_martillo_alcista(row):
     cuerpo = abs(row['close'] - row['open'])
     mecha_inferior = min(row['close'], row['open']) - row['low']
@@ -72,13 +63,6 @@ def es_martillo_bajista(row):
     mecha_superior = row['high'] - max(row['close'], row['open'])
     mecha_inferior = min(row['close'], row['open']) - row['low']
     return mecha_superior > cuerpo * 2 and mecha_inferior < cuerpo
-
-# def es_martillo(row):
-    cuerpo = abs(row['close'] - row['open'])
-    mecha_superior = row['high'] - max(row['close'], row['open'])
-    mecha_inferior = min(row['close'], row['open']) - row['low']
-    return (mecha_inferior > cuerpo * 2) and (mecha_superior < cuerpo)
-
 
 class TradingBot:
     def __init__(self):
@@ -221,18 +205,34 @@ class TradingBot:
             rsi_15m = RSIIndicator(close_15m, window=14).rsi()
 
             latest = -1
-            
+
+            # FILTRO DE MOVIMIENTO BRUSCO (últimas 3 velas >1.5%)
+            if close_5m.iloc[-1] > close_5m.iloc[-4] * 1.015:
+                logger.info("Filtro: Movimiento alcista brusco reciente, probable retroceso. Señal ignorada.")
+                return None
+            if close_5m.iloc[-1] < close_5m.iloc[-4] * 0.985:
+                logger.info("Filtro: Movimiento bajista brusco reciente, probable rebote. Señal ignorada.")
+                return None
+
+            # FILTRO DE ROMPIMIENTO DE BANDA DE BOLLINGER RECIENTE
+            if (high_5m.iloc[-2] >= bb_upper.iloc[-2] or close_5m.iloc[-2] >= bb_upper.iloc[-2]) and close_5m.iloc[-1] < bb_upper.iloc[-1]:
+                logger.info("El precio acaba de romper la banda superior de Bollinger, se espera reversión. Sin señal.")
+                return None
+            if (low_5m.iloc[-2] <= bb_lower.iloc[-2] or close_5m.iloc[-2] <= bb_lower.iloc[-2]) and close_5m.iloc[-1] > bb_lower.iloc[-1]:
+                logger.info("El precio acaba de romper la banda inferior de Bollinger, se espera reversión. Sin señal.")
+                return None
+
+            # FILTRO VOLUMÉTRICO MÁS ESTRICTO
+            vol_actual = vol_5m.iloc[-1]
+            avg_vol_5m = vol_5m.rolling(window=5).mean()
+            volumen_confirmado = vol_actual > avg_vol_5m.iloc[-2] * 1.3
+            if not volumen_confirmado:
+                logger.info("Volumen no supera un 30% el promedio reciente, señal ignorada.")
+                return None
+
             # Validación NAs
             indicators_5m = [ema9_5m, ema21_5m, ema50_5m, macd_diff, rsi_5m, bb_width, atr]
             indicators_15m = [ema21_15m, ema50_15m, rsi_15m]
-            
-            # NUEVO: preparación para validaciones adicionales
-            prev_close = df_5m['close'].iloc[-2]
-            current_close = df_5m['close'].iloc[-1]
-            vol_actual = vol_5m.iloc[-1]
-            vol_3media = vol_5m.rolling(window=3).mean().iloc[-2]
-            patron_martillo_long = es_martillo_alcista(df_5m.iloc[latest])
-            patron_martillo_short = es_martillo_bajista(df_5m.iloc[latest])
             if any(pd.isna(ind.iloc[latest]) for ind in indicators_5m + indicators_15m):
                 return None
 
@@ -250,15 +250,9 @@ class TradingBot:
             trend_15m_bullish = ema21_15m.iloc[latest] > ema50_15m.iloc[latest]
             trend_15m_bearish = ema21_15m.iloc[latest] < ema50_15m.iloc[latest]
 
-            # CONFIRMACIÓN VOLUMEN
-            avg_vol_5m = vol_5m.rolling(window=5).mean()
-            volumen_confirmado = vol_5m.iloc[latest] > avg_vol_5m.iloc[-2]
+            patron_martillo_long = es_martillo_alcista(df_5m.iloc[latest])
+            patron_martillo_short = es_martillo_bajista(df_5m.iloc[latest])
 
-            # PATRÓN VELA MARTILLO
-            #ultimo = df_5m.iloc[latest]
-            #patron_martillo = es_martillo(ultimo)
-
-            # BLOQUE ANTI-SPIKE
             extension_ema = abs(current_price - ema21_5m.iloc[latest]) / ema21_5m.iloc[latest]
             spike_bb_up = current_price > bb_upper.iloc[latest]
             spike_bb_down = current_price < bb_lower.iloc[latest]
@@ -275,7 +269,10 @@ class TradingBot:
             if ((extension_ema > 0.028 or spike_bb_down or spike_vela or sobreventa_rsi) and (macd_diff.iloc[latest] > 0)):
                 logger.info(f"ANTI-SPIKE: Spike bajista + MACD alcista, NO se opera SHORT ni LONG aquí.")
                 return None
-            # FIN BLOQUE ANTI-SPIKE
+
+            prev_close = df_5m['close'].iloc[-2]
+            current_close = df_5m['close'].iloc[-1]
+            tendencia_1h = self.get_trend_higher_tf(symbol, interval='1h')
 
             long_conditions = [
                 ema9_5m.iloc[latest] > ema21_5m.iloc[latest],
@@ -289,9 +286,8 @@ class TradingBot:
                 current_price < bb_upper.iloc[latest] * 0.98,
                 volumen_confirmado,
                 patron_martillo_long, 
-                self.get_trend_higher_tf(symbol, interval='1h')
+                tendencia_1h
             ]
-
             short_conditions = [
                 ema9_5m.iloc[latest] < ema21_5m.iloc[latest],
                 ema21_5m.iloc[latest] < ema50_5m.iloc[latest],
@@ -304,20 +300,20 @@ class TradingBot:
                 current_price > bb_lower.iloc[latest] * 1.02,
                 volumen_confirmado,
                 patron_martillo_short,
-                not self.get_trend_higher_tf(symbol, interval='1h')
+                not tendencia_1h
             ]
 
+            # Ahora exige mínimo 9 de 12 condiciones
             signal = None
-            if sum(long_conditions) >= 7:
+            if sum(long_conditions) >= 9:
                 if self._can_send_signal(symbol, 'buy'):
                     logger.info(f"SIGNAL: SEÑAL LONG fuerte para {symbol} ({sum(long_conditions)}/12 condiciones)")
                     signal = "buy"
-            elif sum(short_conditions) >= 7:
+            elif sum(short_conditions) >= 9:
                 if self._can_send_signal(symbol, 'sell'):
                     logger.info(f"SIGNAL: SEÑAL SHORT fuerte para {symbol} ({sum(short_conditions)}/12 condiciones)")
                     signal = "sell"
 
-            # Filtro estructura de precio
             next_support, next_resistance = self.price_structure_filter(df_5m, df_15m, current_price)
             if signal == "buy" and next_resistance and ((next_resistance - current_price) / current_price) < 0.007:
                 logger.info(f"Filtro estructura: resistencia muy cerca ({next_resistance}) -> señal descartada")
@@ -325,8 +321,7 @@ class TradingBot:
             if signal == "sell" and next_support and ((current_price - next_support) / current_price) < 0.007:
                 logger.info(f"Filtro estructura: soporte muy cerca ({next_support}) -> señal descartada")
                 return None
-            
-            # NUEVO: Confirmación de vela siguiente
+
             if signal == "buy" and current_close < prev_close:
                 logger.info("CONFIRM: Vela actual no confirma subida. Señal long ignorada.")
                 return None
@@ -334,32 +329,16 @@ class TradingBot:
                 logger.info("CONFIRM: Vela actual no confirma caída. Señal short ignorada.")
                 return None
 
-            # NUEVO: Spike + RSI extremo + volumen bajo
+            vol_3media = vol_5m.rolling(window=3).mean().iloc[-2]
             if spike_vela and (sobrecompra_rsi or sobreventa_rsi) and vol_actual < vol_3media:
                 logger.info("ANTI-FAKE: Movimiento sospechoso con volumen bajo y RSI extremo.")
                 return None
 
-            # NUEVO: Confirmación tendencia 1h
-            tendencia_1h = self.get_trend_higher_tf(symbol, interval='1h')
-            if signal == "buy" and not tendencia_1h:
-                logger.info("FILTER: Tendencia 1h bajista, señal long ignorada.")
-                return None
-            if signal == "sell" and tendencia_1h:
-                logger.info("FILTER: Tendencia 1h alcista, señal short ignorada.")
-                return None
-
-            # NUEVO: Confirmación volumen ruptura
-            if vol_actual < vol_3media * 1.1:
-                logger.info("VOL: Volumen no confirma ruptura. Señal descartada.")
-                return None
-
-
             return signal
 
         except Exception as e:
-         logger.error(f"ERROR: Error en análisis técnico para {symbol}: {e}")
-        return None
-
+            logger.error(f"ERROR: Error en análisis técnico para {symbol}: {e}")
+            return None
 
     def btc_market_filter(self):
         df_btc_15m, _ = self.get_klines_multi_timeframe("BTCUSDT")
@@ -430,7 +409,6 @@ class TradingBot:
         key = f"{symbol}_{side}"
         last_signal_time = bot_state['last_signals'].get(key, 0)
         current_time = time.time()
-        # Limitar reenvío de señales para el mismo par en el mismo lado durante 15 minutos
         if current_time - last_signal_time < 900:
             return False
         bot_state['last_signals'][key] = current_time
@@ -489,8 +467,6 @@ class TradingBot:
                 )
                 if response.status_code == 200:
                     logger.info(f"SUCCESS: SEÑAL ENVIADA: {symbol} | {side.upper()}")
-                    # Se elimina el contador diario para no limitar señales
-                    # bot_state['daily_trades'] += 1
                     return True
                 else:
                     logger.warning(f"WARNING: Respuesta Finandy: {response.status_code} - {response.text}")
@@ -505,8 +481,6 @@ class TradingBot:
     def reset_daily_counters(self):
         today = datetime.now().date()
         if bot_state['last_reset'] != today:
-            # No reset de daily_trades porque se eliminó restricción
-            # bot_state['daily_trades'] = 0
             bot_state['failed_symbols'].clear()
             bot_state['last_reset'] = today
             logger.info("RESET: Contadores diarios reseteados")
@@ -514,12 +488,6 @@ class TradingBot:
     def run_bot_cycle(self):
         try:
             self.reset_daily_counters()
-
-            # Elimina limitación por cantidad de trades diarios (para no cortar su ejecución)
-            # if bot_state['daily_trades'] >= 30:
-            #     logger.info("LIMIT: Límite diario de trades alcanzado")
-            #     return
-
             open_positions = self.get_open_positions()
             logger.info(f"POSITIONS: Posiciones abiertas: {len(open_positions)}")
             if len(open_positions) >= MAX_OPEN_TRADES:
@@ -545,7 +513,6 @@ class TradingBot:
 
             logger.info(f"SCAN: Analizando {len(symbols)} símbolos...")
             for symbol in symbols:
-                # Limitar máximo de señales por ciclo a 2 (opcional, mantiene control de cantidad simultánea)
                 if signals_sent >= 2:
                     break
                 if symbol in open_symbols or symbol in bot_state['failed_symbols']:
@@ -568,7 +535,6 @@ class TradingBot:
                 logger.info(f"SUCCESS: Ciclo completado: {signals_sent} señales enviadas")
         except Exception as e:
             logger.error(f"ERROR: Error en ciclo del bot: {e}")
-
 
 def main():
     logger.info("START: Iniciando Trading Bot Mejorado...")
@@ -609,7 +575,6 @@ def main():
         logger.info("RESTART: Reiniciando en 60 segundos...")
         time.sleep(60)
         main()
-
 
 if __name__ == "__main__":
     main()
