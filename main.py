@@ -4,6 +4,9 @@ import pandas as pd
 import requests
 import logging
 import json
+import numpy as np
+import pickle
+import hashlib
 from datetime import datetime, timedelta
 from binance.client import Client
 from ta.trend import EMAIndicator, MACD
@@ -11,17 +14,13 @@ from ta.momentum import RSIIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
 from dotenv import load_dotenv
 
-
-# Configuración del logging - SOLO CONSOLA
+# Configuración del logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler()  # Solo output a consola
-    ]
+    handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
-
 
 # Cargar variables de entorno
 load_dotenv()
@@ -30,22 +29,28 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 FINANDY_SECRET = os.getenv("FINANDY_SECRET")
 FINANDY_HOOK_URL = "https://hook.finandy.com/AAT36Jzdkdb5q0vzrlUK"
 
-
-# Parámetros del bot
+# Parámetros
 MAX_OPEN_TRADES = 5
 MIN_VOLUME = 150_000_000
-MAX_SPREAD_PERCENT = 0.1
-API_CALL_DELAY = 2.0
+MAX_SPREAD_PERCENT = 0.15
+API_CALL_DELAY = 1.0
 SCAN_INTERVAL = 30
-
+LEARNING_DATA_FILE = 'trading_learning_data.pkl'
 
 bot_state = {
     'last_signals': {},
     'failed_symbols': set(),
-    # Se elimina daily_trades para no limitar operaciones diarias
-    'last_reset': datetime.now().date()
+    'last_reset': datetime.now().date(),
+    'symbol_cooldown': {},
+    'signal_stats': {
+        'total_analyzed': 0,
+        'rejected_conditions': 0,
+        'rejected_probability': 0,
+        'rejected_cooldown': 0,
+        'rejected_position': 0,
+        'sent_signals': 0
+    }
 }
-
 
 def create_dataframe(klines):
     df = pd.DataFrame(klines, columns=[
@@ -55,489 +60,275 @@ def create_dataframe(klines):
     ])
     for col in ['open', 'high', 'low', 'close', 'volume']:
         df[col] = pd.to_numeric(df[col], errors='coerce')
-    if df['close'].isna().sum() > 0:
-        return None
-    return df
+    return df if df['close'].notna().all() else None
 
-
-def es_martillo(row):
-    cuerpo = abs(row['close'] - row['open'])
-    mecha_superior = row['high'] - max(row['close'], row['open'])
-    mecha_inferior = min(row['close'], row['open']) - row['low']
-    return (mecha_inferior > cuerpo * 2) and (mecha_superior < cuerpo)
-
-
-class TradingBot:
+class TradingBotFinal:
     def __init__(self):
-        try:
-            if not BINANCE_API_KEY or not BINANCE_API_SECRET:
-                raise ValueError("ERROR: Variables de entorno BINANCE_API_KEY o BINANCE_API_SECRET no configuradas")
-            if not FINANDY_SECRET:
-                raise ValueError("ERROR: Variable de entorno FINANDY_SECRET no configurada")
-            logger.info("INIT: Variables de entorno cargadas correctamente")
-            self.client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
-            logger.info("INIT: Cliente Binance inicializado")
-            self._test_connection()
-        except Exception as e:
-            logger.error(f"ERROR: Error inicializando bot: {e}")
-            raise
+        load_dotenv()
+        self.client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+        logger.info("✅ Bot inicializado correctamente")
 
-    def _test_connection(self):
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                logger.info(f"TEST: Probando conexión a Binance (intento {attempt + 1}/{max_retries})...")
-                server_time = self.client.get_server_time()
-                logger.info(f"TEST: Hora del servidor Binance: {datetime.fromtimestamp(server_time['serverTime']/1000)}")
-                account = self.client.futures_account()
-                logger.info("SUCCESS: Conexión a Binance Futures establecida correctamente")
-                return True
-            except requests.exceptions.ConnectionError as e:
-                logger.error(f"ERROR: Error de conexión (intento {attempt + 1}): {e}")
-                if "getaddrinfo failed" in str(e):
-                    logger.error("ERROR: Problema de DNS. Soluciones sugeridas.")
-            except Exception as e:
-                logger.error(f"ERROR: Error de autenticación o API (intento {attempt + 1}): {e}")
-                if "Invalid API-key" in str(e):
-                    logger.error("ERROR: Verificar BINANCE_API_KEY en archivo .env")
-                elif "Signature for this request" in str(e):
-                    logger.error("ERROR: Verificar BINANCE_API_SECRET en archivo .env")
-            if attempt < max_retries - 1:
-                wait_time = (attempt + 1) * 5
-                logger.info(f"WAIT: Esperando {wait_time} segundos antes del siguiente intento...")
-                time.sleep(wait_time)
-        raise Exception("ERROR: No se pudo establecer conexión con Binance después de 3 intentos")
+    def reset_daily_counters(self):
+        today = datetime.now().date()
+        if bot_state['last_reset'] != today:
+            bot_state['failed_symbols'].clear()
+            bot_state['last_reset'] = today
+            bot_state['signal_stats'] = {k: 0 for k in bot_state['signal_stats']}
+            logger.info("🔄 Contadores diarios reseteados")
 
     def get_futures_symbols(self):
         try:
             tickers = self.client.futures_ticker()
-            exchange_info = self.client.futures_exchange_info()
-            symbol_info = {s['symbol']: s for s in exchange_info['symbols']}
-            total_usdt = self.get_available_usdt()
-            filtered_symbols = []
-            for ticker in tickers:
-                symbol = ticker['symbol']
-                if not symbol.endswith('USDT'):
-                    continue
-                volume = float(ticker['quoteVolume'])
-                if volume < MIN_VOLUME:
-                    continue
-                if symbol in symbol_info:
-                    symbol_data = symbol_info[symbol]
-                    if symbol_data['status'] != 'TRADING':
-                        continue
-                bid_price = float(ticker.get('bidPrice', 0))
-                ask_price = float(ticker.get('askPrice', 0))
-                if bid_price > 0 and ask_price > 0:
-                    spread_percent = ((ask_price - bid_price) / bid_price) * 100
-                    if spread_percent > MAX_SPREAD_PERCENT:
-                        continue
-                if not self._check_minimum_order_value(symbol, symbol_data, total_usdt):
-                    continue
-                filtered_symbols.append(symbol)
-            logger.info(f"SYMBOLS: {len(filtered_symbols)} símbolos válidos encontrados")
-            return filtered_symbols[:50]
+            symbols = [t['symbol'] for t in tickers 
+                      if t['symbol'].endswith('USDT') 
+                      and float(t.get('quoteVolume', 0)) >= MIN_VOLUME]
+            return symbols[:40]
         except Exception as e:
-            logger.error(f"ERROR: Error obteniendo símbolos: {e}")
+            logger.error(f"❌ Error obteniendo símbolos: {e}")
             return []
 
     def get_klines_multi_timeframe(self, symbol):
         try:
-            klines_5m = self.client.futures_klines(symbol=symbol, interval='5m', limit=100)
-            klines_15m = self.client.futures_klines(symbol=symbol, interval='15m', limit=50)
-            if not klines_5m or not klines_15m or len(klines_5m) < 60:
+            klines_5m = self.client.futures_klines(symbol=symbol, interval='5m', limit=60)
+            klines_15m = self.client.futures_klines(symbol=symbol, interval='15m', limit=30)
+            
+            if len(klines_5m) < 50:
                 return None, None
-            df_5m = create_dataframe(klines_5m)
-            df_15m = create_dataframe(klines_15m)
-            if df_5m is not None:
-                last_timestamp = pd.to_datetime(df_5m['timestamp'].iloc[-1], unit='ms')
-                if datetime.now() - last_timestamp.tz_localize(None) > timedelta(minutes=10):
-                    logger.warning(f"WARNING: Datos obsoletos para {symbol}")
-                    return None, None
-            return df_5m, df_15m
-        except Exception as e:
-            logger.error(f"ERROR: Error obteniendo klines para {symbol}: {e}")
+                
+            return create_dataframe(klines_5m), create_dataframe(klines_15m)
+        except:
             return None, None
 
-    def get_trend_higher_tf(self, symbol, interval='1h'):
-        try:
-            klines = self.client.futures_klines(symbol=symbol, interval=interval, limit=100)
-            df = create_dataframe(klines)
-            if df is None:
-                return False
-            close = df['close']
-            ema21 = EMAIndicator(close, window=21).ema_indicator()
-            ema50 = EMAIndicator(close, window=50).ema_indicator()
-            # Tendencia alcista si EMA21 > EMA50
-            return ema21.iloc[-1] > ema50.iloc[-1]
-        except Exception as e:
-            logger.error(f"ERROR: get_trend_higher_tf para {symbol} intervalo {interval}: {e}")
-            return False
-
-    def technical_signal_enhanced(self, df_5m, df_15m, symbol):
-        if df_5m is None or df_15m is None or len(df_5m) < 60:
-            return None
-        try:
-            close_5m = df_5m['close']
-            high_5m = df_5m['high']
-            low_5m = df_5m['low']
-            vol_5m = df_5m['volume']
-
-            ema9_5m = EMAIndicator(close_5m, window=9).ema_indicator()
-            ema21_5m = EMAIndicator(close_5m, window=21).ema_indicator()
-            ema50_5m = EMAIndicator(close_5m, window=50).ema_indicator()
-
-            macd_5m = MACD(close_5m)
-            macd_line = macd_5m.macd()
-            macd_signal = macd_5m.macd_signal()
-            macd_diff = macd_5m.macd_diff()
-
-            rsi_5m = RSIIndicator(close_5m, window=14).rsi()
-            bb_5m = BollingerBands(close_5m, window=20, window_dev=2)
-            bb_upper = bb_5m.bollinger_hband()
-            bb_lower = bb_5m.bollinger_lband()
-            bb_middle = bb_5m.bollinger_mavg()
-            bb_width = (bb_upper - bb_lower) / bb_middle
-
-            atr = AverageTrueRange(high_5m, low_5m, close_5m, window=14).average_true_range()
-
-            close_15m = df_15m['close']
-            ema21_15m = EMAIndicator(close_15m, window=21).ema_indicator()
-            ema50_15m = EMAIndicator(close_15m, window=50).ema_indicator()
-            rsi_15m = RSIIndicator(close_15m, window=14).rsi()
-
-            latest = -1
-
-            # Validación NAs
-            indicators_5m = [ema9_5m, ema21_5m, ema50_5m, macd_diff, rsi_5m, bb_width, atr]
-            indicators_15m = [ema21_15m, ema50_15m, rsi_15m]
-            if any(pd.isna(ind.iloc[latest]) for ind in indicators_5m + indicators_15m):
-                return None
-
-            current_price = close_5m.iloc[latest]
-            atr_value = atr.iloc[latest] / current_price
-            max_volatility = 0.025
-            min_macd_strength = atr_value * 0.5
-            if bb_width.iloc[latest] > max_volatility and atr_value > 0.02:
-                return None
-
-            ema_diff_5m = abs(ema9_5m.iloc[latest] - ema21_5m.iloc[latest]) / current_price
-            if ema_diff_5m < 0.001:
-                return None
-
-            trend_15m_bullish = ema21_15m.iloc[latest] > ema50_15m.iloc[latest]
-            trend_15m_bearish = ema21_15m.iloc[latest] < ema50_15m.iloc[latest]
-
-            # CONFIRMACIÓN VOLUMEN: Volumen actual vs promedio rolling ultimas 5 velas (sin contar la última)
-            avg_vol_5m = vol_5m.rolling(window=5).mean()
-            volumen_confirmado = vol_5m.iloc[latest] > avg_vol_5m.iloc[-2]
-
-            # PATRÓN VELA MARTILLO EN ÚLTIMA VELA 5min
-            ultimo = df_5m.iloc[latest]
-            patron_martillo = es_martillo(ultimo)
-
-            long_conditions = [
-                ema9_5m.iloc[latest] > ema21_5m.iloc[latest],
-                ema21_5m.iloc[latest] > ema50_5m.iloc[latest],
-                trend_15m_bullish,
-                45 < rsi_5m.iloc[latest] < 70,
-                30 < rsi_15m.iloc[latest] < 75,
-                macd_diff.iloc[latest] > min_macd_strength,
-                macd_line.iloc[latest] > macd_signal.iloc[latest],
-                current_price > bb_middle.iloc[latest],
-                current_price < bb_upper.iloc[latest] * 0.98,
-                volumen_confirmado,
-                patron_martillo,
-                self.get_trend_higher_tf(symbol, interval='1h')  # Tendencia 1h alcista
-            ]
-
-            short_conditions = [
-                ema9_5m.iloc[latest] < ema21_5m.iloc[latest],
-                ema21_5m.iloc[latest] < ema50_5m.iloc[latest],
-                trend_15m_bearish,
-                30 < rsi_5m.iloc[latest] < 55,
-                25 < rsi_15m.iloc[latest] < 70,
-                macd_diff.iloc[latest] < -min_macd_strength,
-                macd_line.iloc[latest] < macd_signal.iloc[latest],
-                current_price < bb_middle.iloc[latest],
-                current_price > bb_lower.iloc[latest] * 1.02,
-                volumen_confirmado,
-                not self.get_trend_higher_tf(symbol, interval='1h')  # Tendencia 1h bajista
-            ]
-
-            signal = None
-            if sum(long_conditions) >= 7:
-                if self._can_send_signal(symbol, 'buy'):
-                    logger.info(f"SIGNAL: SEÑAL LONG fuerte para {symbol} ({sum(long_conditions)}/12 condiciones)")
-                    signal = "sell"
-            elif sum(short_conditions) >= 7:
-                if self._can_send_signal(symbol, 'sell'):
-                    logger.info(f"SIGNAL: SEÑAL SHORT fuerte para {symbol} ({sum(short_conditions)}/12 condiciones)")
-                    signal = "buy"
-
-            # Filtros de estructura de precio
-            next_support, next_resistance = self.price_structure_filter(df_5m, df_15m, current_price)
-            if signal == "buy" and next_resistance and ((next_resistance - current_price) / current_price) < 0.007:
-                logger.info(f"Filtro estructura: resistencia muy cerca ({next_resistance}) -> señal descartada")
-                return None
-            if signal == "sell" and next_support and ((current_price - next_support) / current_price) < 0.007:
-                logger.info(f"Filtro estructura: soporte muy cerca ({next_support}) -> señal descartada")
-                return None
-
-            return signal
-        except Exception as e:
-            logger.error(f"ERROR: Error en análisis técnico para {symbol}: {e}")
-            return None
-
-    def btc_market_filter(self):
-        df_btc_15m, _ = self.get_klines_multi_timeframe("BTCUSDT")
-        if df_btc_15m is None:
-            return True
-        atr_btc = AverageTrueRange(df_btc_15m['high'], df_btc_15m['low'], df_btc_15m['close'], window=14).average_true_range().iloc[-1]
-        change_15m = (df_btc_15m['close'].iloc[-1] - df_btc_15m['close'].iloc[-4]) / df_btc_15m['close'].iloc[-4]
-        if abs(change_15m) > 0.015 or (atr_btc / df_btc_15m['close'].iloc[-1]) > 0.02:
-            logger.warning("BTC muy volátil → Pausando señales")
-            return False
-        return True
-
-    def detect_recent_pivots(self, df, threshold=0.01):
-        pivots = []
-        last_pivot = df['close'].iloc[0]
-        last_direction = None
-        for i in range(1, len(df)):
-            price = df['close'].iloc[i]
-            change = (price - last_pivot) / last_pivot
-            if abs(change) >= threshold:
-                direction = "up" if change > 0 else "down"
-                if last_direction != direction:
-                    pivots.append((df.index[i], price))
-                    last_pivot = price
-                    last_direction = direction
-        return pivots[-5:]
-
-    def price_structure_filter(self, df_5m, df_15m, current_price):
-        pivots_5m = self.detect_recent_pivots(df_5m, threshold=0.008)
-        pivots_15m = self.detect_recent_pivots(df_15m, threshold=0.01)
-        levels = sorted(set([p[1] for p in pivots_5m + pivots_15m]))
-        next_resistance = min([lvl for lvl in levels if lvl > current_price], default=None)
-        next_support = max([lvl for lvl in levels if lvl < current_price], default=None)
-        return next_support, next_resistance
-
-    def _check_minimum_order_value(self, symbol, symbol_info, total_usdt):
-        try:
-            first_order_value = total_usdt * 0.128
-            filters = symbol_info.get('filters', [])
-            min_notional = 0
-            min_qty = 0
-            for filter_item in filters:
-                if filter_item['filterType'] in ['MIN_NOTIONAL', 'NOTIONAL']:
-                    min_notional = float(filter_item.get('notional', filter_item.get('minNotional', 0)))
-                elif filter_item['filterType'] in ['LOT_SIZE', 'MARKET_LOT_SIZE']:
-                    min_qty = float(filter_item.get('minQty', 0))
-            if min_notional > 0 and first_order_value < min_notional:
-                logger.warning(f"SKIP: {symbol} rechazado - Primera orden ${first_order_value:.2f} < MIN_NOTIONAL ${min_notional:.2f}")
-                return False
-            if min_qty > 0:
-                try:
-                    ticker = self.client.futures_symbol_ticker(symbol=symbol)
-                    current_price = float(ticker['price'])
-                    calculated_qty = first_order_value / current_price
-                    if calculated_qty < min_qty:
-                        logger.debug(f"FILTER: {symbol} rechazado - Cantidad calculada {calculated_qty:.6f} < MIN_QTY {min_qty:.6f}")
-                        return False
-                except Exception as e:
-                    logger.debug(f"FILTER: Error obteniendo precio para {symbol}: {e}")
-                    return False
-            logger.debug(f"FILTER: {symbol} aprobado - Primera orden ${first_order_value:.2f} cumple requisitos")
-            return True
-        except Exception as e:
-            logger.error(f"ERROR: Error verificando valor mínimo para {symbol}: {e}")
-            return False
-
-    def _can_send_signal(self, symbol, side):
-        key = f"{symbol}_{side}"
-        last_signal_time = bot_state['last_signals'].get(key, 0)
-        current_time = time.time()
-        # Limitar reenvío de señales para el mismo par en el mismo lado durante 15 minutos
-        if current_time - last_signal_time < 900:
-            return False
-        bot_state['last_signals'][key] = current_time
-        return True
-
     def get_open_positions(self):
+        """Obtener posiciones abiertas en futuros"""
         try:
-            positions = self.client.futures_account()['positions']
-            open_positions = []
-            for pos in positions:
+            account = self.client.futures_account()
+            positions = []
+            for pos in account['positions']:
                 if float(pos['positionAmt']) != 0:
-                    pnl = 0.0
-                    if 'unrealizedPnl' in pos:
-                        pnl = float(pos['unrealizedPnl'])
-                    elif 'unRealizedProfit' in pos:
-                        pnl = float(pos['unRealizedProfit'])
-                    open_positions.append({
+                    positions.append({
                         'symbol': pos['symbol'],
                         'size': float(pos['positionAmt']),
                         'entry_price': float(pos.get('entryPrice', 0)),
-                        'pnl': pnl
+                        'pnl': float(pos.get('unrealizedPnl', 0))
                     })
-            return open_positions
+            return positions
         except Exception as e:
-            logger.error(f"ERROR: Error obteniendo posiciones: {e}")
+            logger.error(f"❌ Error obteniendo posiciones: {e}")
             return []
 
     def get_available_usdt(self):
         try:
             balances = self.client.futures_account_balance()
-            for balance in balances:
-                if balance['asset'] == 'USDT':
-                    total_balance = float(balance['balance'])
-                    logger.info(f"BALANCE: USDT total: ${total_balance:.4f}")
-                    return total_balance
-            logger.warning("WARNING: No se encontró balance de USDT")
-            return 0
-        except Exception as e:
-            logger.error(f"ERROR: Error obteniendo balance: {e}")
+            usdt_balance = next((float(b['balance']) for b in balances if b['asset'] == 'USDT'), 0)
+            return usdt_balance
+        except:
             return 0
 
-    def send_signal_to_finandy(self, symbol, side):
-        payload = {
-            "secret": FINANDY_SECRET,
-            "symbol": symbol,
-            "side": side
-        }
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                response = requests.post(
-                    FINANDY_HOOK_URL,
-                    json=payload,
-                    timeout=10,
-                    headers={'Content-Type': 'application/json'}
-                )
-                if response.status_code == 200:
-                    logger.info(f"SUCCESS: SEÑAL ENVIADA: {symbol} | {side.upper()}")
-                    # Se elimina el contador diario para no limitar señales
-                    # bot_state['daily_trades'] += 1
-                    return True
-                else:
-                    logger.warning(f"WARNING: Respuesta Finandy: {response.status_code} - {response.text}")
-            except requests.exceptions.RequestException as e:
-                logger.error(f"ERROR: Error enviando señal (intento {attempt + 1}): {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(2)
-        logger.error(f"ERROR: Falló envío de señal para {symbol} después de {max_retries} intentos")
-        bot_state['failed_symbols'].add(symbol)
-        return False
+    def is_symbol_in_cooldown(self, symbol):
+        if symbol in bot_state['symbol_cooldown']:
+            last_trade = bot_state['symbol_cooldown'][symbol]
+            remaining = (datetime.now() - last_trade).total_seconds() / 60
+            return remaining < 30, max(0, 30 - remaining)
+        return False, 0
 
-    def reset_daily_counters(self):
-        today = datetime.now().date()
-        if bot_state['last_reset'] != today:
-            # No reset de daily_trades porque se eliminó restricción
-            # bot_state['daily_trades'] = 0
-            bot_state['failed_symbols'].clear()
-            bot_state['last_reset'] = today
-            logger.info("RESET: Contadores diarios reseteados")
+    def check_existing_position(self, symbol):
+        """Verificar si hay posición abierta en el símbolo"""
+        try:
+            positions = self.get_open_positions()
+            return symbol in [p['symbol'] for p in positions]
+        except:
+            return False
+
+    def check_brutal_movement(self, symbol):
+        """Detectar movimientos extremos"""
+        try:
+            klines = self.client.futures_klines(symbol=symbol, interval='5m', limit=6)
+            if len(klines) < 6:
+                return False, None, 0
+            
+            df = create_dataframe(klines)
+            start_price = df['close'].iloc[0]
+            end_price = df['close'].iloc[-1]
+            change_pct = ((end_price - start_price) / start_price) * 100
+            
+            if abs(change_pct) > 5:
+                opposite_side = 'sell' if change_pct > 0 else 'buy'
+                return True, opposite_side, change_pct
+            
+            return False, None, 0
+        except:
+            return False, None, 0
+
+    def calculate_signal_score(self, df_5m, df_15m):
+        """Evaluar señal con score"""
+        try:
+            close_5m = df_5m['close']
+            vol_5m = df_5m['volume']
+
+            # Indicadores
+            ema9 = EMAIndicator(close_5m, window=9).ema_indicator().iloc[-1]
+            ema21 = EMAIndicator(close_5m, window=21).ema_indicator().iloc[-1]
+            ema50 = EMAIndicator(close_5m, window=50).ema_indicator().iloc[-1]
+            
+            rsi = RSIIndicator(close_5m, window=14).rsi().iloc[-1]
+            macd_line = MACD(close_5m).macd().iloc[-1]
+            macd_signal = MACD(close_5m).macd_signal().iloc[-1]
+
+            # Score LONG
+            long_score = 0
+            long_checks = [
+                ema9 > ema21,
+                ema21 > ema50,
+                45 <= rsi <= 70,
+                macd_line > macd_signal,
+                vol_5m.iloc[-1] > vol_5m.rolling(5).mean().iloc[-2]
+            ]
+            long_score = sum(long_checks) / len(long_checks)
+
+            # Score SHORT
+            short_score = 0
+            short_checks = [
+                ema9 < ema21,
+                ema21 < ema50,
+                30 <= rsi <= 55,
+                macd_line < macd_signal,
+                vol_5m.iloc[-1] > vol_5m.rolling(5).mean().iloc[-2]
+            ]
+            short_score = sum(short_checks) / len(short_checks)
+
+            if long_score >= 0.6:
+                return 'buy', long_score
+            elif short_score >= 0.7:
+                return 'sell', short_score
+            
+            return None, 0
+        except:
+            return None, 0
+
+    def send_signal_to_finandy(self, symbol, side, reason=""):
+        """Enviar señal"""
+        payload = {"secret": FINANDY_SECRET, "symbol": symbol, "side": side}
+        
+        try:
+            response = requests.post(FINANDY_HOOK_URL, json=payload, timeout=10)
+            success = response.status_code == 200
+            if success:
+                bot_state['symbol_cooldown'][symbol] = datetime.now()
+            return success
+        except:
+            return False
+
+    def btc_market_filter(self):
+        """Verificar estado del mercado BTC"""
+        try:
+            klines = self.client.futures_klines(symbol="BTCUSDT", interval='15m', limit=4)
+            if len(klines) >= 4:
+                df = create_dataframe(klines)
+                change = abs((df['close'].iloc[-1] - df['close'].iloc[0]) / df['close'].iloc[0])
+                return change <= 0.025
+        except:
+            pass
+        return True
 
     def run_bot_cycle(self):
+        """Ejecutar ciclo completo"""
         try:
             self.reset_daily_counters()
-
-            # Elimina limitación por cantidad de trades diarios (para no cortar su ejecución)
-            # if bot_state['daily_trades'] >= 30:
-            #     logger.info("LIMIT: Límite diario de trades alcanzado")
-            #     return
-
+            
             open_positions = self.get_open_positions()
-            logger.info(f"POSITIONS: Posiciones abiertas: {len(open_positions)}")
+            logger.info(f"📊 RESUMEN: {len(open_positions)}/{MAX_OPEN_TRADES} trades abiertos")
+            
             if len(open_positions) >= MAX_OPEN_TRADES:
-                logger.info("LIMIT: Límite de operaciones abiertas alcanzado")
+                logger.info("🛑 Límite alcanzado")
                 return
 
             if not self.btc_market_filter():
-                logger.warning("PAUSE: Mercado BTC volátil, se pausará el ciclo")
+                logger.warning("⚠️ Mercado BTC volátil")
                 return
 
             total_usdt = self.get_available_usdt()
             if total_usdt < 50:
-                logger.warning(f"WARNING: Capital insuficiente para operar. Balance total: ${total_usdt:.2f}")
+                logger.warning(f"💰 Capital: ${total_usdt:.2f}")
                 return
 
             symbols = self.get_futures_symbols()
             if not symbols:
-                logger.error("ERROR: No se pudieron obtener símbolos")
+                logger.error("❌ Sin símbolos disponibles")
                 return
 
-            open_symbols = {pos['symbol'] for pos in open_positions}
             signals_sent = 0
-
-            logger.info(f"SCAN: Analizando {len(symbols)} símbolos...")
+            analyzed = 0
+            
             for symbol in symbols:
-                # Limitar máximo de señales por ciclo a 2 (opcional, mantiene control de cantidad simultánea)
-                if signals_sent >= 2:
+                if signals_sent >= 3:
                     break
-                if symbol in open_symbols or symbol in bot_state['failed_symbols']:
+                
+                analyzed += 1
+                
+                # Verificaciones rápidas
+                in_cooldown, remaining = self.is_symbol_in_cooldown(symbol)
+                if in_cooldown:
+                    logger.debug(f"⏰ {symbol} cooldown ({remaining:.1f}min)")
                     continue
+                
+                if self.check_existing_position(symbol):
+                    logger.debug(f"📈 {symbol} ya tiene posición")
+                    continue
+                
                 try:
                     df_5m, df_15m = self.get_klines_multi_timeframe(symbol)
-                    signal = self.technical_signal_enhanced(df_5m, df_15m, symbol)
-                    if signal:
-                        if self.send_signal_to_finandy(symbol, signal):
+                    if df_5m is None:
+                        continue
+                    
+                    # Movimiento brusco
+                    brutal_move, opposite, change_pct = self.check_brutal_movement(symbol)
+                    if brutal_move:
+                        logger.info(f"🎯 {symbol}: {change_pct:.1f}% → {opposite}")
+                        if self.send_signal_to_finandy(symbol, opposite, "Contrarian"):
                             signals_sent += 1
-                            open_symbols.add(symbol)
+                            continue
+                    
+                    # Señal técnica
+                    signal, score = self.calculate_signal_score(df_5m, df_15m)
+                    if signal and score >= 0.6:
+                        logger.info(f"✅ {symbol}: {signal.upper()} (score: {score:.1%})")
+                        if self.send_signal_to_finandy(symbol, signal, "Technical"):
+                            signals_sent += 1
+                            
                 except Exception as e:
-                    logger.error(f"ERROR: Error procesando {symbol}: {e}")
-                    bot_state['failed_symbols'].add(symbol)
+                    logger.debug(f"⚠️ Error {symbol}: {e}")
+                
                 time.sleep(API_CALL_DELAY)
 
-            if signals_sent == 0:
-                logger.info("SCAN: No se encontraron señales válidas en este ciclo")
-            else:
-                logger.info(f"SUCCESS: Ciclo completado: {signals_sent} señales enviadas")
+            logger.info(f"📈 CICLO: {signals_sent} señal(es) | {analyzed} analizados")
+            
         except Exception as e:
-            logger.error(f"ERROR: Error en ciclo del bot: {e}")
-
+            logger.error(f"💥 ERROR: {e}")
 
 def main():
-    logger.info("START: Iniciando Trading Bot Mejorado...")
-    try:
-        import socket
-        socket.create_connection(("8.8.8.8", 53), timeout=5)
-        logger.info("NETWORK: Conectividad a internet verificada")
-    except Exception as e:
-        logger.error(f"ERROR: Sin conexión a internet: {e}")
-        logger.error("FIX: Verificar conexión de red antes de continuar")
-        return
-    try:
-        bot = TradingBot()
-        logger.info("SUCCESS: Bot inicializado correctamente")
-        while True:
+    logger.info("🚀 Iniciando Trading Bot Final...")
+    
+    bot = TradingBotFinal()
+    
+    while True:
+        try:
             start_time = time.time()
-            logger.info("=" * 50)
-            logger.info("CYCLE: Iniciando nuevo ciclo de escaneo...")
-            try:
-                bot.run_bot_cycle()
-            except requests.exceptions.ConnectionError as e:
-                logger.error(f"ERROR: Error de conexión durante ciclo: {e}")
-                logger.info("WAIT: Esperando 60 segundos para reconectar...")
-                time.sleep(60)
-                continue
-            except Exception as e:
-                logger.error(f"ERROR: Error en ciclo: {e}")
-                time.sleep(30)
-                continue
-            execution_time = time.time() - start_time
-            logger.info(f"TIMING: Ciclo completado en {execution_time:.2f} segundos")
-            logger.info(f"WAIT: Esperando {SCAN_INTERVAL} segundos hasta próximo escaneo...")
-            time.sleep(SCAN_INTERVAL)
-    except KeyboardInterrupt:
-        logger.info("STOP: Bot detenido por usuario")
-    except Exception as e:
-        logger.error(f"ERROR: Error crítico del bot: {e}")
-        logger.info("RESTART: Reiniciando en 60 segundos...")
-        time.sleep(60)
-        main()
-
+            logger.info("\n" + "="*60)
+            
+            bot.run_bot_cycle()
+            
+            elapsed = time.time() - start_time
+            sleep_time = max(0, SCAN_INTERVAL - elapsed)
+            logger.info(f"⏱️ Esperando {sleep_time:.1f}s...")
+            time.sleep(sleep_time)
+            
+        except KeyboardInterrupt:
+            logger.info("🛑 Bot detenido")
+            break
+        except Exception as e:
+            logger.error(f"💥 ERROR: {e}")
+            time.sleep(30)
 
 if __name__ == "__main__":
     main()
